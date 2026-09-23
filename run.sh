@@ -13,10 +13,11 @@ dir=$(dirname "$0")
 # looked in another — and every tick would exit here, silently, forever.
 state="${SNOOZE_STATE_DIR:-${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/${HERDR_PLUGIN_ID:-herdr-snooze}}}"
 
-# The default herdr session keeps its state file in $state; any other session
-# in $state/sessions/<key>/ (snooze.py's state_dir()). Working out this
-# session's key would cost a process, so look for a file in any of them: a
-# cheap glob, and Python only starts while something is snoozed somewhere.
+# Each herdr session keeps its state in $state/sessions/<key>/ (snooze.py's
+# state_dir()); 0.1.0 kept one file at $state/snoozed.json, which still needs
+# Python until it's been recovered. Working out this session's key would cost
+# a process, so look for a file in any of them: a cheap glob, and Python only
+# starts while something is snoozed somewhere.
 anything_snoozed() {
   [ -f "$state/snoozed.json" ] && return 0
   for f in "$state"/sessions/*/snoozed.json; do

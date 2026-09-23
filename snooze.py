@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -108,26 +109,38 @@ def socket_path():
     return os.environ.get("HERDR_SOCKET_PATH") or default_socket()
 
 
-def session_key():
-    """'' for the default herdr session, else a short key for this one.
+def session_identity():
+    """What makes this herdr session this one: its socket, and the identity of
+    the directory the socket lives in. A server restart keeps both (snoozes are
+    meant to survive it); deleting a named session and creating one with the
+    same name makes a new directory, so the new session is a different one —
+    and herdr numbers its panes from w1:p1 again, so an old record must never
+    be read as its own."""
+    sock = os.path.realpath(socket_path())
+    try:
+        home = os.stat(os.path.dirname(sock))
+        born = [home.st_ino, int(getattr(home, "st_birthtime", 0))]
+    except OSError:
+        born = None
+    return {"socket": sock, "born": born}
+
+
+def session_key(identity=None):
+    """A short key for one herdr session, from session_identity().
 
     Pane and workspace IDs only mean something inside one herdr session, but
-    the state directory is shared by all of them: without this, a second
-    session would read the first one's snoozes, hide its own unrelated `w1:p1`
-    or delete the first's records as closed panes. The socket identifies the
-    session. The default session keeps the directory 0.1.0 used, so an
-    upgrade finds its snoozes where it left them."""
-    sock = os.path.realpath(socket_path())
-    if sock == os.path.realpath(default_socket()):
-        return ""
-    return hashlib.sha1(sock.encode("utf-8")).hexdigest()[:12]
+    the plugin's state directory is shared by all of them: without a key per
+    session, a second session would read the first one's snoozes, hide its
+    own unrelated `w1:p1` or delete the first's records as closed panes."""
+    ident = identity or session_identity()
+    return hashlib.sha1(json.dumps(ident, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def state_dir():
-    """This session's state directory. run.sh's fast path must agree on where
-    state can live: it checks the plugin dir and every sessions/*/ below it."""
-    key = session_key()
-    return os.path.join(plugin_state_dir(), "sessions", key) if key else plugin_state_dir()
+    """This session's state directory: sessions/<key>/ in the plugin's. run.sh's
+    fast path must agree on where state can live: every sessions/*/, plus
+    0.1.0's single file at the top (see recover_legacy)."""
+    return os.path.join(plugin_state_dir(), "sessions", session_key())
 
 
 def config_dir():
@@ -353,7 +366,10 @@ def read_state():
         state["view"] = dict(RECOVER)
         return state
     state = empty_state()
-    damaged = not isinstance(data, dict)
+    # Snooze writes every key, every time, and deletes the file when idle: a
+    # file that exists without them (or with the wrong types) is damaged,
+    # never a quiet "nothing snoozed".
+    damaged = not isinstance(data, dict) or any(not isinstance(data.get(k), dict) for k in ("panes", "workspaces", "view"))
     if isinstance(data, dict):
         # Every hook reads this file; one malformed entry (a hand edit, a
         # half-understood older version) must not make all of them crash.
@@ -364,8 +380,6 @@ def read_state():
                     if isinstance(entry, dict) and isinstance(entry.get("until"), int)
                 }
                 damaged = damaged or len(state[key]) != len(data[key])
-            elif key in data:
-                damaged = True
         if isinstance(data.get("view"), dict):
             state["view"] = dict(data["view"])
             if "inherited" in state["view"] and not isinstance(state["view"]["inherited"], dict):
@@ -387,6 +401,13 @@ def locked_state():
     read-modify-write of the state file happens under one flock."""
     root = state_dir()
     os.makedirs(root, exist_ok=True)
+    ident_path = os.path.join(root, "session.json")
+    if not os.path.exists(ident_path):
+        # Which session this directory belongs to, so prune_stale_sessions
+        # can tell when that session no longer exists.
+        with open(ident_path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(session_identity(), handle)
+        os.replace(ident_path + ".tmp", ident_path)
     with open(os.path.join(root, "lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read_state()
@@ -407,6 +428,78 @@ def locked_state():
                 with open(path + ".tmp", "w", encoding="utf-8") as handle:
                     json.dump(state, handle, indent=1, sort_keys=True)
                 os.replace(path + ".tmp", path)
+
+
+def prune_stale_sessions():
+    """Remove the state of herdr sessions that no longer exist.
+
+    A deleted session's directory would otherwise stay forever: its file keeps
+    run.sh starting Python in every session's hooks. Its records are safe to
+    drop: tokens and views die with the server that held them, and a
+    recreated session of the same name is a different one (session_key)."""
+    root = os.path.join(plugin_state_dir(), "sessions")
+    try:
+        keys = os.listdir(root)
+    except OSError:
+        return
+    mine = session_key()
+    for key in keys:
+        if key == mine:
+            continue
+        path = os.path.join(root, key)
+        try:
+            with open(os.path.join(path, "session.json"), encoding="utf-8") as handle:
+                ident = json.load(handle)
+            sock = ident["socket"]
+            home = os.stat(os.path.dirname(sock))
+            alive = ident.get("born") == [home.st_ino, int(getattr(home, "st_birthtime", 0))]
+        except FileNotFoundError:
+            alive = False  # its session directory is gone (or it never had an identity)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # can't tell: leave it
+        if not alive:
+            log("removing state of a herdr session that no longer exists:", key)
+            shutil.rmtree(path, ignore_errors=True)
+
+
+# 0.1.0 kept one state file for every session, at the top of the plugin's
+# state directory. Its records may belong to any session, so none adopts them.
+LEGACY_GRACE_S = 25 * 3600  # herdr's longest token TTL (24h), and some margin
+
+
+def recover_legacy(config):
+    """Once per session after upgrading from 0.1.0: fail open. If this
+    session's own state is idle, anything of ours still in it (a view, a token
+    with no record) came from 0.1.0 — clear it, so agents reappear rather than
+    stay hidden by a record no session will read again. The old file goes once
+    every token it could stand for has expired (LEGACY_GRACE_S), so a session
+    that isn't running in that window has nothing left to recover (its view
+    died with its server)."""
+    root = plugin_state_dir()
+    legacy = os.path.join(root, "snoozed.json")
+    if not os.path.exists(legacy):
+        return
+    since_path = os.path.join(root, "legacy-since")
+    try:
+        with open(since_path, encoding="utf-8") as handle:
+            since = float(handle.read().strip())
+    except (OSError, ValueError):
+        since = time.time()
+        with contextlib.suppress(OSError), open(since_path, "w", encoding="utf-8") as handle:
+            handle.write("%d\n" % since)
+    marker = os.path.join(state_dir(), "legacy-recovered")
+    if not os.path.exists(marker):
+        with locked_state() as state:
+            if is_idle(state):
+                state["view"] = dict(RECOVER)
+            sync(state, config)
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("0.1.0 state recovered\n")
+        log("recovered after upgrading from 0.1.0: cleared this session's leftover view and tokens")
+    if time.time() - since > LEGACY_GRACE_S:
+        for path in (legacy, since_path):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
 
 
 # ── reconcile (pure) ─────────────────────────────────────────────────────────
@@ -1067,6 +1160,9 @@ def main(argv):
         return run_picker()
 
     if command == "tick":
+        prune_stale_sessions()
+        if os.path.exists(os.path.join(plugin_state_dir(), "snoozed.json")):
+            recover_legacy(load_config())
         if is_idle(read_state()):
             # Nothing to do. If a file is there anyway (every entry in it was
             # malformed and dropped), remove it: while it exists, run.sh starts

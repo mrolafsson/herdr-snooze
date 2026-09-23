@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -613,7 +614,8 @@ class Commands(unittest.TestCase):
                         mock.patch.object(snooze, "load_config", return_value=dict(SyncAgainstFakeHerdr.config))):
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.file = os.path.join(self.dir.name, "snoozed.json")
+        os.makedirs(snooze.state_dir(), exist_ok=True)
+        self.file = os.path.join(snooze.state_dir(), "snoozed.json")
 
     def snoozed(self, until):
         with open(self.file, "w") as handle:
@@ -686,6 +688,58 @@ class Commands(unittest.TestCase):
                 self.assertEqual(self.herdr.view, {"active": False})
                 self.assertFalse(os.path.exists(self.file))  # or run.sh starts Python on every hook, forever
 
+    def test_missing_or_wrong_view_counts_as_damaged(self):
+        # Round 2: these read as "idle", so the file went without a check.
+        for broken in ('{"view": "x"}', '{"v": 1, "panes": {}, "workspaces": {}, "view": null}', '{"v": 1}'):
+            with self.subTest(broken=broken):
+                self.herdr.view = {"active": True, "source": snooze.SOURCE, "label": "z 1"}
+                with open(self.file, "w") as handle:
+                    handle.write(broken)
+                self.assertEqual(snooze.main(["tick"]), 0)
+                self.assertEqual(self.herdr.view, {"active": False}, "our filter left live")
+                self.assertFalse(os.path.exists(self.file))
+
+    # ── upgrading from 0.1.0: one state file for every session, at the top ──
+
+    def legacy(self):
+        path = os.path.join(self.dir.name, "snoozed.json")
+        with open(path, "w") as handle:
+            handle.write('{"panes": {"zz": {"until": %d, "via": "pane"}}, "workspaces": {}, "view": {}}' % (snooze.now_ms() + HOUR))
+        return path
+
+    def test_0_1_0_state_is_adopted_by_no_session_and_fails_open(self):
+        legacy = self.legacy()
+        self.panes[1]["tokens"][snooze.TOKEN] = "z 12:00"  # 0.1.0's token, maybe this session's
+        self.herdr.view = {"active": True, "source": snooze.SOURCE, "label": "z 1"}
+        self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertNotIn(snooze.TOKEN, self.panes[1]["tokens"])  # the agent reappears
+        self.assertEqual(self.herdr.view, {"active": False})
+        self.assertEqual(snooze.read_state()["panes"], {})  # "zz" wasn't adopted as ours
+        self.assertTrue(os.path.exists(legacy))  # other sessions still need to see it
+
+    def test_each_session_recovers_once(self):
+        self.legacy()
+        snooze.main(["tick"])
+        self.herdr.calls.clear()
+        self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertEqual(self.herdr.calls, [], "recovered again on every hook")
+
+    def test_0_1_0_file_goes_once_every_token_it_stood_for_has_expired(self):
+        legacy = self.legacy()
+        snooze.main(["tick"])
+        with open(os.path.join(self.dir.name, "legacy-since"), "w") as handle:
+            handle.write("%d\n" % (snooze.time.time() - snooze.LEGACY_GRACE_S - 60))
+        snooze.main(["tick"])
+        self.assertFalse(os.path.exists(legacy), "left behind, it keeps every hook starting Python")
+
+    def test_a_session_with_its_own_snoozes_keeps_them_through_recovery(self):
+        self.snoozed(snooze.now_ms() + HOUR)
+        snooze.main(["tick"])  # takes the view for "zz"
+        self.legacy()
+        self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertIn("zz", snooze.read_state()["panes"])
+        self.assertEqual(self.herdr.view.get("source"), snooze.SOURCE)
+
     def test_damaged_file_leaves_another_plugins_view_alone(self):
         with open(self.file, "w") as handle:
             handle.write("{not json")
@@ -720,33 +774,70 @@ class Sessions(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        env = {"SNOOZE_STATE_DIR": self.dir.name, "XDG_CONFIG_HOME": os.path.join(self.dir.name, "cfg")}
+        self.state = os.path.join(self.dir.name, "state")
+        env = {"SNOOZE_STATE_DIR": self.state, "XDG_CONFIG_HOME": os.path.join(self.dir.name, "cfg")}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("HERDR_SOCKET_PATH", None)
+        self.log = mock.patch.object(snooze, "log").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def session(self, name):
+        """A herdr session's directory, as herdr makes one, and its socket."""
+        home = os.path.join(self.dir.name, "sessions", name)
+        os.makedirs(home, exist_ok=True)
+        return os.path.join(home, "herdr.sock")
 
     def in_session(self, sock):
-        return mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": sock} if sock else {})
+        return mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": sock})
 
-    def test_default_session_keeps_the_0_1_0_location(self):
-        self.assertEqual(snooze.state_dir(), self.dir.name)
-        with self.in_session(snooze.default_socket()):
-            self.assertEqual(snooze.state_dir(), self.dir.name)
+    def snooze_in(self, sock, pane_id="w1:p1"):
+        with self.in_session(sock), snooze.locked_state() as st:
+            st["panes"][pane_id] = {"until": snooze.now_ms() + HOUR, "via": "pane"}
 
-    def test_each_other_session_gets_its_own_state(self):
-        with self.in_session("/tmp/work.sock"):
+    def test_every_session_has_its_own_state(self):
+        work, play = self.session("work"), self.session("play")
+        self.snooze_in(work)
+        with self.in_session(work):
             a = snooze.state_dir()
-            with snooze.locked_state() as st:
-                st["panes"]["w1:p1"] = {"until": snooze.now_ms() + HOUR, "via": "pane"}
-        with self.in_session("/tmp/play.sock"):
-            b = snooze.state_dir()
+            self.assertIn("w1:p1", snooze.read_state()["panes"])
+        with self.in_session(play):
+            self.assertNotEqual(snooze.state_dir(), a)
             self.assertEqual(snooze.read_state()["panes"], {})  # play doesn't see work's w1:p1
-        self.assertNotEqual(a, b)
-        self.assertTrue(a.startswith(os.path.join(self.dir.name, "sessions")))
-        self.assertEqual(snooze.read_state()["panes"], {})  # nor does the default session
-        with self.in_session("/tmp/work.sock"):
-            self.assertIn("w1:p1", snooze.read_state()["panes"])  # and work still has it
+        self.assertTrue(a.startswith(os.path.join(self.state, "sessions")))
+        self.assertTrue(snooze.state_dir().startswith(os.path.join(self.state, "sessions")))  # default too
+
+    def test_a_recreated_session_never_reads_the_old_ones_records(self):
+        # herdr numbers a new session's panes from w1:p1 again.
+        work = self.session("work")
+        self.snooze_in(work)
+        shutil.rmtree(os.path.dirname(work))  # herdr session delete work
+        work = self.session("work")  # …and a new "work"
+        with self.in_session(work):
+            self.assertEqual(snooze.read_state()["panes"], {})
+
+    def test_state_of_a_deleted_session_is_pruned(self):
+        work, play = self.session("work"), self.session("play")
+        self.snooze_in(work)
+        self.snooze_in(play)
+        with self.in_session(work):
+            work_state = snooze.state_dir()
+        with self.in_session(play):
+            play_state = snooze.state_dir()
+        shutil.rmtree(os.path.dirname(work))  # work is deleted
+        with self.in_session(play):
+            snooze.prune_stale_sessions()
+        self.assertFalse(os.path.exists(work_state), "a deleted session's file keeps every hook starting Python")
+        self.assertTrue(os.path.exists(os.path.join(play_state, "snoozed.json")))
+
+    def test_a_stopped_or_restarted_session_keeps_its_state(self):
+        work, play = self.session("work"), self.session("play")
+        self.snooze_in(work)
+        with self.in_session(play):
+            snooze.prune_stale_sessions()  # work's directory is still there: only its server is down
+        with self.in_session(work):
+            self.assertIn("w1:p1", snooze.read_state()["panes"])
 
 
 class RunSh(unittest.TestCase):
@@ -778,7 +869,8 @@ class RunSh(unittest.TestCase):
     def test_idle_everywhere_starts_nothing(self):
         self.assertFalse(self.tick())
 
-    def test_default_session_state_starts_python(self):
+    def test_a_0_1_0_state_file_starts_python(self):
+        # Until each session has recovered from it (recover_legacy).
         open(os.path.join(self.dir.name, "snoozed.json"), "w").close()
         self.assertTrue(self.tick())
 
@@ -796,7 +888,8 @@ class StateFile(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"SNOOZE_STATE_DIR": self.dir.name})
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.path = os.path.join(self.dir.name, "snoozed.json")
+        os.makedirs(snooze.state_dir(), exist_ok=True)
+        self.path = os.path.join(snooze.state_dir(), "snoozed.json")
 
     def test_saved_even_when_the_body_fails(self):
         # tokens may already be on panes when a later herdr call dies

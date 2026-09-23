@@ -303,10 +303,19 @@ survive a server restart, and another plugin can replace the view. Each snooze
 also arms one detached `sleep` that runs a tick at the next moment something
 needs doing. It sleeps, ticks once and is gone; it is not a daemon.
 
-Each herdr session has its own state, since pane IDs only mean something inside
-one session: the default session keeps `snoozed.json` in the plugin's state
-directory, and any other session in `sessions/<key>/` below it, keyed by its
-socket.
+Each herdr session has its own state, in `sessions/<key>/` under the plugin's
+state directory, since pane IDs only mean something inside one session. The key
+comes from the session's socket and its directory, so deleting a named session
+and creating a new one with the same name (whose panes herdr numbers from
+`w1:p1` again) never picks up the old one's snoozes. State left by a session
+that no longer exists is removed.
+
+**Upgrading from 0.1.0**, which kept one file for every session: no session
+can know whose records those were, so none adopts them. Instead each session,
+the first time it runs 0.1.1, un-hides anything 0.1.0 may have left hidden in
+it. Agents snoozed under 0.1.0 therefore come back once on upgrade; snooze them
+again. The old file is removed a day later, once every token it could stand
+for has expired.
 
 The state file exists only while something is snoozed, and every command goes
 through `run.sh`, which exits before starting Python when a hook finds no file
