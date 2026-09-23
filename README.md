@@ -184,11 +184,19 @@ the space covers whatever runs in it). The same agent keeps its snooze through
 its snooze. If the picker was left open while its pane moved, closed or got a
 new agent, it says so instead of snoozing the wrong thing.
 
-herdr tells snooze only which kind of agent runs in a pane, not which process,
-so "exited" means herdr showed the pane without an agent. herdr also does that
-when an agent hands the terminal to another program (an editor it opened, say)
-for more than a few seconds. That agent then loses its snooze and reappears. It
-never works the other way: a new agent is never hidden by an old snooze.
+A new agent is recognised from what herdr reports: its `pane.agent_detected`
+event, sent each time herdr takes up an agent process in a pane (a quick
+restart of the same agent included, `/clear` and the like not), or the pane
+shown without an agent in between. herdr also shows a pane without its agent
+when the agent hands the terminal to another program (an editor it opened,
+say) for more than a few seconds; that agent then loses its snooze and
+reappears. If herdr doesn't deliver the event (the plugin disabled at that
+moment, say), a new agent of the same kind that starts without such a gap
+keeps the old snooze until it ends or you wake it.
+
+One gap is left: a pane moved to another space and herdr stopped within the
+same instant, before snooze's hook for the move ran, comes back after the
+restart without its snooze, so it shows again.
 
 **Sharing the Agents panel.** herdr has one agent view, and the last plugin to
 set it wins. While something is snoozed, snooze keeps its view in place,
@@ -343,7 +351,9 @@ Between events, one detached `sleep` runs a tick at the next moment something
 needs doing, and at least every five minutes while anything is snoozed. It
 sleeps, ticks once and is gone; it is not a daemon. Its process ID is kept, so
 if it dies (killed, or the machine slept) the next event arms a new one, and
-one replaced by an earlier deadline is stopped.
+one replaced by an earlier deadline is stopped. If its own tick fails (herdr
+busy or restarting), it arms a retry five minutes out, for as long as herdr's
+socket is there.
 
 Each herdr session has its own state, in `sessions/<key>/` under the plugin's
 state directory, since pane IDs only mean something inside one session. The key

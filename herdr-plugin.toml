@@ -71,9 +71,11 @@ command = ["/bin/sh", "run.sh", "tick", "--force"]
 on = "pane.agent_status_changed"
 command = ["/bin/sh", "run.sh", "tick"]
 
+# herdr took up an agent process in a pane: also a new agent of the same kind,
+# which pane.list alone can't tell from the old one.
 [[events]]
 on = "pane.agent_detected"
-command = ["/bin/sh", "run.sh", "tick"]
+command = ["/bin/sh", "run.sh", "tick", "--detected"]
 
 # Also fires on every space switch, so workspace.focused would only double up.
 [[events]]

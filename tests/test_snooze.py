@@ -255,15 +255,63 @@ class Reconcile(unittest.TestCase):
         snooze.reconcile(st, [pane("stay"), moved(pane("p1"), "w2:p1", "w2")], self.now)
         self.assertEqual(st["panes"]["w2:p1"]["via"], "pane")
 
-    def test_a_woken_pane_stays_woken_when_it_moves_within_its_space(self):
-        # Woken early out of a snoozed space, then moved to another tab of it:
-        # a new ID that isn't on the except list would be re-adopted, hidden.
+    def test_a_woken_pane_stays_woken_when_it_moves_out_and_back(self):
+        # Woken early out of a snoozed space, moved to another space and back:
+        # herdr gives it a new ID each time (a move within a space keeps it).
+        # A new ID that isn't on the except list would be re-adopted, hidden.
         st = state(workspaces={"w1": {"until": self.now + HOUR, "token_until": self.now + HOUR, "except": ["p1"]}})
-        snooze.reconcile(st, [pane("p1"), pane("other")], self.now)  # learns p1's terminal
-        st["panes"].pop("other")
-        snooze.reconcile(st, [moved(pane("p1"), "p1-tab2", "w1")], self.now)
-        self.assertNotIn("p1-tab2", st["panes"])
-        self.assertEqual(st["workspaces"]["w1"]["except"], ["p1-tab2"])
+        snooze.reconcile(st, [pane("p1"), pane("other", workspace="w2")], self.now)  # learns p1's terminal
+        p = pane("p1")
+        snooze.reconcile(st, [moved(p, "w2:p1", "w2"), pane("stay")], self.now)
+        snooze.reconcile(st, [moved(p, "w1:p1-back", "w1"), pane("stay")], self.now)
+        self.assertNotIn("w1:p1-back", st["panes"])
+        self.assertEqual(st["workspaces"]["w1"]["except"], ["w1:p1-back"])
+
+    def test_a_restart_gives_terminals_new_ids_and_known_panes_learn_them(self):
+        # A cold restart keeps pane IDs but allocates new terminal IDs; a record
+        # matched by pane ID picks up the new one, so a later move still works.
+        st = self.snoozed_claude(via="pane", workspace_id="w1", terminal_id="t-old")
+        p = pane("p1", tokens=live_token())
+        p["terminal_id"] = "t-new"
+        snooze.reconcile(st, [p], self.now)
+        self.assertEqual(st["panes"]["p1"]["terminal_id"], "t-new")
+        snooze.reconcile(st, [moved(p, "w2:p1", "w2")], self.now)
+        self.assertEqual(list(st["panes"]), ["w2:p1"])
+
+    def test_a_move_then_a_restart_before_any_tick_loses_the_snooze(self):
+        # Documented limit: the pane.moved hook re-keys within milliseconds;
+        # only a crash in that window leaves neither the old ID nor the old
+        # terminal to find. The pane then shows again (never wrongly hidden).
+        st = self.snoozed_claude(via="pane", workspace_id="w1", terminal_id="t-p1")
+        p = moved(pane("p1"), "w2:p1", "w2")
+        p["terminal_id"] = "t-restored"
+        self.assertEqual(snooze.reconcile(st, [p], self.now), [])
+        self.assertEqual(st["panes"], {})
+
+    # ── v0.2: herdr's pane.agent_detected tells a new process of the same kind ──
+
+    def test_a_quick_restart_of_the_same_agent_drops_the_snooze(self):
+        # Round 4: Claude A exits and Claude B starts before herdr ever shows
+        # the pane without an agent. Only the detected event can tell.
+        st = self.snoozed_claude(since=self.now - HOUR)
+        self.assertTrue(snooze.agent_detected(st, "p1", self.now))
+        self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-b")], self.now), [("clear", "p1")])
+
+    def test_a_late_detection_of_the_snoozed_agent_itself_is_ignored(self):
+        st = self.snoozed_claude(since=self.now - 2000)
+        self.assertFalse(snooze.agent_detected(st, "p1", self.now))
+        self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-a")], self.now), [])
+
+    def test_detections_elsewhere_change_nothing(self):
+        st = self.snoozed_claude(since=self.now - HOUR)
+        self.assertFalse(snooze.agent_detected(st, "p2", self.now))
+        self.assertNotIn("agent_gone", st["panes"]["p1"])
+
+    def test_the_detected_pane_is_found_in_herdrs_event(self):
+        event = {"event": "pane.agent_detected", "data": {"pane_id": "w1:p3", "agent": "claude"}}
+        self.assertEqual(snooze.detected_pane(event), "w1:p3")
+        self.assertIsNone(snooze.detected_pane({"event": "x"}))
+        self.assertIsNone(snooze.detected_pane(None))
 
     def test_a_closed_pane_is_not_mistaken_for_a_moved_one(self):
         st = self.snoozed_claude(terminal_id="t-p1")
@@ -961,6 +1009,44 @@ class Commands(unittest.TestCase):
         with patch, mock.patch.object(snooze.fcntl, "flock", flock):
             snooze.main(["tick"])
         self.assertEqual(len(runs), 1)
+
+    def test_a_detected_hook_marks_the_pane_and_is_never_coalesced_away(self):
+        # Its event is the only evidence of a same-kind replacement: a note
+        # for the running tick would lose it, so it waits its turn instead.
+        with open(self.file, "w") as handle:
+            handle.write('{"panes": {"zz": {"until": %d, "via": "pane", "since": 0, "agent_id": {"agent": "claude"}}}}'
+                         % (snooze.now_ms() + HOUR))
+        snooze.main(["tick"])
+        self.assertIn(snooze.MARK, self.panes[1]["tokens"])
+        event = {"event": "pane.agent_detected", "data": {"pane_id": "zz", "agent": "claude"}}
+        root = snooze.state_dir()
+        with open(os.path.join(root, "tick.lock"), "a") as lock, \
+                mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": snooze.json.dumps(event)}):
+            snooze.fcntl.flock(lock, snooze.fcntl.LOCK_EX)  # a plain tick is running
+            self.assertEqual(snooze.main(["tick", "--detected"]), 0)
+        self.assertEqual(snooze.read_state()["panes"], {})
+        self.assertNotIn(snooze.MARK, self.panes[1]["tokens"], "the new agent shows")
+
+    def test_a_failed_timer_tick_arms_a_retry(self):
+        # Round 4: the sleeper ticks once; if that tick fails and no hook
+        # follows, nothing would arm the next and long snoozes lapse.
+        self.snoozed(snooze.now_ms() + 2 * 24 * HOUR)
+        open(os.environ["HERDR_SOCKET_PATH"], "w").close()  # herdr is up
+        broken = mock.Mock(side_effect=OSError("herdr busy"))
+        with mock.patch.object(snooze, "call", broken):
+            for args in (["tick"], ["tick", "--timer"]):
+                snooze._spawn_timer.reset_mock()
+                with self.assertRaises(OSError):
+                    snooze.main(args)
+                self.assertEqual(snooze._spawn_timer.called, args == ["tick", "--timer"], args)
+            os.remove(os.environ["HERDR_SOCKET_PATH"])  # herdr gone: don't keep a sleeper going
+            snooze._spawn_timer.reset_mock()
+            with self.assertRaises(OSError):
+                snooze.main(["tick", "--timer"])
+            snooze._spawn_timer.assert_not_called()
+
+    def test_the_sleeper_ticks_as_a_timer(self):
+        self.assertTrue(snooze.TIMER_SCRIPT.endswith("tick --timer"))
 
     def test_toggle_there_and_back(self):
         self.snoozed(snooze.now_ms() + HOUR)

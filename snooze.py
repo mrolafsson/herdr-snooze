@@ -743,7 +743,7 @@ def reconcile(state, panes, now, force=False, badge=DEFAULT_BADGE):
             if pane.get("workspace_id") == wid and pid not in state["panes"] and pid not in space.get("except", []):
                 state["panes"][pid] = {
                     "until": space["until"], "via": "workspace", "workspace_id": wid, "dirty": True,
-                    "agent_id": agent_identity(pane), "terminal_id": pane.get("terminal_id"),
+                    "agent_id": agent_identity(pane), "terminal_id": pane.get("terminal_id"), "since": now,
                 }
         # Workspace tokens are not visible from pane.list, so only the clock
         # (or a forced pass after a server restart) can say one needs sending.
@@ -848,16 +848,17 @@ def agent_identity(pane):
 
 def replaced(entry, pane):
     """Whether the agent in the pane is not the one that was snoozed: another
-    kind, or any agent after this pane was seen with none.
+    kind, or any agent after this pane was seen with none, or after herdr
+    reported a new agent process there (agent_detected, below).
 
     pane.list carries no process identity, and agent_session changes on the
     same agent's /clear, resume and compact, so neither can tell. What herdr
-    does give: it clears `agent` when the agent exits (its shell is back in
-    the foreground), and also after several missed probes while something
-    else holds the foreground. So an agent that hands its terminal to an
-    editor for a while loses its snooze and shows again; the other way round,
-    a newly started agent would stay hidden. A record from before 0.2 (no
-    identity) adopts the agent it finds."""
+    does give: pane.agent_detected each time it takes up an agent process,
+    including a new one of the same kind (and not on /clear and the like);
+    and `agent` cleared when the agent exits, or after several missed probes
+    while something else holds the foreground, so an agent that hands its
+    terminal to an editor for a while loses its snooze and shows again. A
+    record from before 0.2 (no identity) adopts the agent it finds."""
     current = agent_identity(pane)
     if current is None:
         entry["agent_gone"] = True  # it hides nothing until an agent returns
@@ -869,6 +870,35 @@ def replaced(entry, pane):
         entry["agent_id"] = current
         return False
     return recorded.get("agent") != current["agent"]
+
+
+# A detection this soon after a snooze began is the snoozed agent's own,
+# delivered late: the picker only offers panes whose agent herdr already had.
+DETECTED_GRACE_MS = 10 * 1000
+
+
+def agent_detected(state, pane_id, now):
+    """herdr took up a new agent process in pane_id. If a snooze there predates
+    it, the agent it was for is gone: the next reconcile treats the pane as
+    replaced. Returns True if a record was marked."""
+    entry = state["panes"].get(pane_id)
+    if entry is None or now - entry.get("since", 0) < DETECTED_GRACE_MS:
+        return False
+    entry["agent_gone"] = True
+    return True
+
+
+def detected_pane(event):
+    """The pane_id in a pane.agent_detected hook's event JSON, wherever herdr
+    nests it, or None."""
+    if isinstance(event, dict):
+        if isinstance(event.get("pane_id"), str):
+            return event["pane_id"]
+        for value in event.values():
+            found = detected_pane(value)
+            if found:
+                return found
+    return None
 
 
 def known_sort(owner, views=None):
@@ -1008,7 +1038,7 @@ def probe_view():
     return call("agent.view.clear", {"source": SOURCE + ".probe"})
 
 
-TIMER_SCRIPT = 'sleep "$1" && exec /bin/sh "$2" tick'
+TIMER_SCRIPT = 'sleep "$1" && exec /bin/sh "$2" tick --timer'
 
 
 def _spawn_timer(delay_s):
@@ -1177,7 +1207,7 @@ def snooze(kind, target, until, config, expect_agent=None):
                 if entry.get("workspace_id") == target:
                     entry.update({"until": until_ms, "via": "workspace", "dirty": True})
         else:
-            record = {"until": until_ms, "via": "pane", "dirty": True}
+            record = {"until": until_ms, "via": "pane", "dirty": True, "since": now_ms()}
             if expect_agent is not None:
                 pane = next((p for p in call("pane.list").get("panes", []) if p["pane_id"] == target), None)
                 if pane is None:
@@ -1514,7 +1544,7 @@ USAGE = """usage: snooze.py <command>
   action agent|workspace          what the herdr actions run (opens the duration picker)
   action wake                     wake the focused pane's agent, no popup
   picker                          the popup itself
-  tick [--force]                  reconcile tokens and the agent view
+  tick [--force|--detected|--timer]  reconcile tokens and the agent view
   toggle                          Agents panel: only snoozed <-> active
   snooze <pane_id|workspace:ID> <duration>
   wake --all | <pane_id|workspace:ID>...
@@ -1535,13 +1565,31 @@ def tick(args):
     finds another one running leaves a note and exits, and the running one
     goes again — a burst is a couple of passes, not a queue of processes each
     waiting on the lock and on herdr. Every pass reads everything from herdr,
-    so no tick carries anything a later pass would miss. The startup --force
-    runs regardless: it resets what a restart left behind.
+    so plain ticks carry nothing a later pass would miss. Two run regardless:
+    the startup --force (it resets what a restart left behind) and a
+    --detected one, whose event (a new agent process in a pane) no later pass
+    could see.
 
     No note is ever stranded: the runner looks again after unlocking, and a
     tick that left a note tries the lock once more, so either the note's
-    writer runs or the lock's holder will see the note after unlocking."""
+    writer runs or the lock's holder will see the note after unlocking.
+
+    A --timer tick is the detached sleeper's; if it fails (herdr busy or
+    restarting), nothing else may come along to arm the next one, so it arms a
+    retry itself while herdr's socket is there."""
+    try:
+        return _tick(args)
+    except Exception:
+        if "--timer" in args and os.path.exists(socket_path()) and not is_idle(read_state()):
+            with contextlib.suppress(OSError):
+                _spawn_timer(SAFETY_MS // 1000)
+        raise
+
+
+def _tick(args):
     root = state_dir()
+    if "--detected" in args:
+        return _tick_once(args, detected=detected_pane(hook_event()))
     if "--force" in args or not os.path.isdir(root):
         return _tick_once(args)
     pending = os.path.join(root, "tick.pending")
@@ -1563,7 +1611,14 @@ def tick(args):
                 return 0
 
 
-def _tick_once(args):
+def hook_event():
+    try:
+        return json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "null")
+    except ValueError:
+        return None
+
+
+def _tick_once(args, detected=None):
     prune_stale_sessions()
     if os.path.exists(os.path.join(plugin_state_dir(), "snoozed.json")):
         recover_legacy(load_config())
@@ -1576,6 +1631,8 @@ def _tick_once(args):
                 pass
         return 0
     with locked_state() as state:
+        if detected and agent_detected(state, detected, now_ms()):
+            log("a new agent process in", detected, "- its snooze was for the one before")
         sync(state, load_config(), force="--force" in args)
     return 0
 
