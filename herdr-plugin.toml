@@ -83,3 +83,8 @@ command = ["/bin/sh", "run.sh", "tick"]
 [[events]]
 on = "pane.closed"
 command = ["/bin/sh", "run.sh", "tick"]
+
+# A pane moved to another space gets a new ID: its snooze follows it.
+[[events]]
+on = "pane.moved"
+command = ["/bin/sh", "run.sh", "tick"]

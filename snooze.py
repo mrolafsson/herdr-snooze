@@ -43,12 +43,18 @@ MAX_SNOOZE_S = 366 * 86400
 DEFAULT_DURATIONS = ["15m", "1h", "3h", "6h", "1d", "3d", "1w"]
 DEFAULT_BADGE = "\U0001F4A4"  # 💤
 
-VIEW_FILTER = {"op": "not", "filter": {"op": "exists", "field": {"token": TOKEN}}}
+# Token names aren't owned in herdr: any plugin could write `snoozed`. So every
+# snoozed pane carries two: `snoozed`, the badge text people show in their
+# sidebar ("$snoozed"), and MARK, which is snooze's alone. Filters and "is this
+# ours?" go by MARK; `snoozed` is only for display.
+MARK = "herdr_snooze"
+
+VIEW_FILTER = {"op": "not", "filter": {"op": "exists", "field": {"token": MARK}}}
 # The snoozed list also lets blocked agents through: it is the one panel state
 # that hides your active agents, and one of them needing you is exactly what
 # the panel exists to show.
 SNOOZED_LIST_FILTER = {"op": "any", "filters": [
-    {"op": "exists", "field": {"token": TOKEN}},
+    {"op": "exists", "field": {"token": MARK}},
     {"op": "eq", "field": "status", "value": "blocked"},
 ]}
 
@@ -304,7 +310,10 @@ def parse_until(text, now=None):
         raise ValueError("duration must be more than zero")
     if seconds > MAX_SNOOZE_S:
         raise ValueError("that's more than a year — close the pane instead?")
-    return now + timedelta(seconds=seconds)
+    # Elapsed time, not wall-clock arithmetic: across a daylight-saving change
+    # "2h" must still mean two hours from now (a clock time like 9am above
+    # stays a clock time).
+    return datetime.fromtimestamp(now.timestamp() + seconds)
 
 
 def describe(spec):
@@ -693,27 +702,64 @@ def reconcile(state, panes, now, force=False, badge=DEFAULT_BADGE):
             ops.append(("clear", pid))
             del state["panes"][pid]
             continue
-        present = TOKEN in (pane.get("tokens") or {})
+        if replaced(entry, pane):
+            # The agent that was snoozed exited and another started in the same
+            # pane: the snooze was for that one, not this.
+            ops.append(("clear", pid))
+            del state["panes"][pid]
+            continue
+        present = MARK in (pane.get("tokens") or {})
         if _token_due(entry, now, present=present and not force):
             ops.append(_token_op("report", pid, entry, now, badge))
 
     # A token with no record behind it (state file lost, a run that died
-    # halfway) is an agent hidden for up to a day that no list shows. Token
-    # names aren't owned in herdr, so only a value we'd have written (it starts
-    # with our badge) is taken for ours; another plugin's `snoozed` stays.
+    # halfway) is an agent hidden for up to a day that no list shows. MARK is
+    # ours alone; a `snoozed` token without it is taken for ours only if 0.1.x
+    # could have written it (it starts with our badge): another plugin's stays.
     cleared = {op[1] for op in ops if op[0] == "clear"}
     for pid, pane in live.items():
-        value = (pane.get("tokens") or {}).get(TOKEN)
-        if pid not in state["panes"] and pid not in cleared and value is not None and looks_ours(value, badge):
+        tokens = pane.get("tokens") or {}
+        ours = MARK in tokens or (TOKEN in tokens and looks_ours(tokens[TOKEN], badge))
+        if pid not in state["panes"] and pid not in cleared and ours:
             ops.append(("clear", pid))
     return ops
 
 
 def looks_ours(value, badge):
-    """Whether a `snoozed` token's value is one snooze wrote: _token_op always
-    starts it with the badge. With no badge configured there's nothing to tell
-    by, so it's taken for ours."""
+    """Whether a `snoozed` token without MARK is one snooze 0.1.x wrote:
+    _token_op always started it with the badge. With no badge configured
+    there's nothing to tell by, so it's taken for ours."""
     return not badge or str(value).startswith(badge)
+
+
+def agent_identity(pane):
+    """Which agent runs in a pane: its kind, and the session herdr reports for
+    it when it has one. None when there's no agent."""
+    if not pane.get("agent"):
+        return None
+    session = pane.get("agent_session")
+    return {"agent": pane.get("agent"), "session": session.get("value") if isinstance(session, dict) else None}
+
+
+def replaced(entry, pane):
+    """Whether the agent in the pane is not the one that was snoozed. A
+    record from before 0.2 (no identity) adopts the current agent; one that
+    only knew the agent's kind learns its session when herdr reports it. With
+    no session reported, a new agent of the same kind can't be told apart."""
+    current = agent_identity(pane)
+    recorded = entry.get("agent_id")
+    if current is None:
+        return False  # the agent exited: the record hides nothing until one returns
+    if not isinstance(recorded, dict):
+        entry["agent_id"] = current
+        return False
+    if recorded.get("agent") != current["agent"]:
+        return True
+    if recorded.get("session") and current["session"] and recorded["session"] != current["session"]:
+        return True
+    if not recorded.get("session") and current["session"]:
+        entry["agent_id"] = current
+    return False
 
 
 def known_sort(owner, views=None):
@@ -835,13 +881,13 @@ def send_token_ops(ops):
         kind, target = op[0], op[1]
         try:
             if kind == "report":
-                call("pane.report_metadata", {"pane_id": target, "source": SOURCE, "tokens": {TOKEN: op[2]}, "ttl_ms": op[3]})
+                call("pane.report_metadata", {"pane_id": target, "source": SOURCE, "tokens": {TOKEN: op[2], MARK: "1"}, "ttl_ms": op[3]})
             elif kind == "clear":
-                call("pane.report_metadata", {"pane_id": target, "source": SOURCE, "tokens": {TOKEN: None}})
+                call("pane.report_metadata", {"pane_id": target, "source": SOURCE, "tokens": {TOKEN: None, MARK: None}})
             elif kind == "ws_report":
-                call("workspace.report_metadata", {"workspace_id": target, "source": SOURCE, "tokens": {TOKEN: op[2]}, "ttl_ms": op[3]})
+                call("workspace.report_metadata", {"workspace_id": target, "source": SOURCE, "tokens": {TOKEN: op[2], MARK: "1"}, "ttl_ms": op[3]})
             elif kind == "ws_clear":
-                call("workspace.report_metadata", {"workspace_id": target, "source": SOURCE, "tokens": {TOKEN: None}})
+                call("workspace.report_metadata", {"workspace_id": target, "source": SOURCE, "tokens": {TOKEN: None, MARK: None}})
         except HerdrError as error:
             log("token op failed:", op, error)  # a pane closing mid-sync is not worth aborting for
             failed.append(op)
@@ -959,8 +1005,50 @@ def sync(state, config, force=False, strict=False):
     return panes
 
 
-def snooze(kind, target, until, config):
-    """kind is 'pane' or 'workspace'. Returns how many panes are now covered."""
+def moved_pane(event):
+    """The pane_moved payload in a hook's event JSON ({previous_pane_id,
+    previous_workspace_id, pane}), wherever herdr nests it, or None."""
+    if isinstance(event, dict):
+        if isinstance(event.get("previous_pane_id"), str) and isinstance(event.get("pane"), dict):
+            return event
+        for value in event.values():
+            found = moved_pane(value)
+            if found:
+                return found
+    return None
+
+
+def follow_move(state, move):
+    """A pane moved to another space keeps its terminal but gets a new ID:
+    carry its snooze over, or the next tick would forget it as closed and wake
+    it early. Returns True if anything changed."""
+    previous, pane = move["previous_pane_id"], move["pane"]
+    new = pane.get("pane_id")
+    if not new or new == previous:
+        return False
+    changed = False
+    if previous in state["panes"]:
+        entry = state["panes"].pop(previous)
+        if entry.get("via") == "workspace" and pane.get("workspace_id") != move.get("previous_workspace_id"):
+            entry["via"] = "pane"  # it left the snoozed space: it keeps its own deadline
+        entry["workspace_id"] = pane.get("workspace_id")
+        entry["dirty"] = True  # the token may not have come along
+        state["panes"][new] = entry
+        changed = True
+    for space in state["workspaces"].values():
+        if previous in space.get("except", []):
+            space["except"] = [new if p == previous else p for p in space["except"]]
+            changed = True
+    return changed
+
+
+def snooze(kind, target, until, config, expect_agent=None):
+    """kind is 'pane' or 'workspace'. Returns how many panes are now covered.
+
+    expect_agent is the agent the picker showed. The popup can stay open a
+    while; if that pane has since closed, moved (a new pane ID), or a
+    different agent started in it, snoozing now would hide something the
+    person never chose — so it's refused instead."""
     until_ms = to_ms(until)
     with locked_state() as state:
         if kind == "workspace":
@@ -969,7 +1057,15 @@ def snooze(kind, target, until, config):
                 if entry.get("workspace_id") == target:
                     entry.update({"until": until_ms, "via": "workspace", "dirty": True})
         else:
-            state["panes"][target] = {"until": until_ms, "via": "pane", "dirty": True}
+            record = {"until": until_ms, "via": "pane", "dirty": True}
+            if expect_agent is not None:
+                pane = next((p for p in call("pane.list").get("panes", []) if p["pane_id"] == target), None)
+                if pane is None:
+                    raise ValueError("that pane moved or closed; open snooze on it again")
+                if replaced({"agent_id": expect_agent}, pane):
+                    raise ValueError("a different agent is running there now; open snooze on it again")
+                record["agent_id"] = agent_identity(pane) or expect_agent
+            state["panes"][target] = record
             # Its own deadline now outranks its space's: without this, a shorter
             # snooze ends, the agent reappears, and the space re-adopts it a
             # tick later for the rest of the space's (longer) snooze.
@@ -1178,7 +1274,13 @@ def picker_snooze(term, config):
             until = prompt(term, header, "Snooze for how long, or until when?")
         if until is None:
             continue
-        covered = snooze(kind, target, until, config)
+        expect = None
+        if kind == "pane":
+            try:
+                expect = json.loads(os.environ.get("SNOOZE_AGENT") or "null")
+            except ValueError:
+                expect = None
+        covered = snooze(kind, target, until, config, expect_agent=expect if isinstance(expect, dict) else None)
         return "snoozed %s %s (%d pane(s)) until %s" % (kind, target, covered, until.strftime("%Y-%m-%d %H:%M"))
 
 
@@ -1278,7 +1380,8 @@ def run_action(name):
         notify("Snooze", "This pane has no agent, so there is nothing to hide.")
         return 1
     detail = " · ".join(part for part in (pane.get("agent"), context.get("workspace_label")) if part)
-    env = {"SNOOZE_KIND": "pane", "SNOOZE_TARGET": pane_id, "SNOOZE_LABEL": pane_label(pane), "SNOOZE_DETAIL": detail}
+    env = {"SNOOZE_KIND": "pane", "SNOOZE_TARGET": pane_id, "SNOOZE_LABEL": pane_label(pane), "SNOOZE_DETAIL": detail,
+           "SNOOZE_AGENT": json.dumps(agent_identity(pane))}
     return open_picker(env, height)
 
 
@@ -1295,6 +1398,62 @@ USAGE = """usage: snooze.py <command>
   list"""
 
 
+def hook_event():
+    try:
+        return json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "null")
+    except ValueError:
+        return None
+
+
+def tick(args):
+    """What every hook runs. Hooks fire in bursts (each focus change, each
+    status flip): a plain tick that finds another one running leaves a note
+    and exits, and the running one goes once more — a burst is a couple of
+    passes, not a queue of processes each waiting on the lock and on herdr.
+    A tick that carries something (a pane move, the startup --force) waits
+    its turn instead: what it carries would be lost."""
+    move = moved_pane(hook_event())
+    root = state_dir()
+    if move or "--force" in args or not os.path.isdir(root):
+        return _tick_once(args, move)
+    pending = os.path.join(root, "tick.pending")
+    with open(os.path.join(root, "tick.lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            with open(pending, "a"):
+                pass
+            return 0
+        for _ in range(3):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(pending)
+            _tick_once(args, None)
+            if not os.path.exists(pending):
+                break
+    return 0
+
+
+def _tick_once(args, move):
+    prune_stale_sessions()
+    if os.path.exists(os.path.join(plugin_state_dir(), "snoozed.json")):
+        recover_legacy(load_config())
+    if move and read_state()["panes"]:
+        with locked_state() as state:
+            if follow_move(state, move):
+                log("followed a moved pane:", move["previous_pane_id"], "->", move["pane"].get("pane_id"))
+    if is_idle(read_state()):
+        # Nothing to do. If a file is there anyway (every entry in it was
+        # malformed and dropped), remove it: while it exists, run.sh starts
+        # Python on every focus change, forever.
+        if os.path.exists(os.path.join(state_dir(), "snoozed.json")):
+            with locked_state():
+                pass
+        return 0
+    with locked_state() as state:
+        sync(state, load_config(), force="--force" in args)
+    return 0
+
+
 def main(argv):
     if not argv:
         print(USAGE)
@@ -1307,20 +1466,7 @@ def main(argv):
         return run_picker()
 
     if command == "tick":
-        prune_stale_sessions()
-        if os.path.exists(os.path.join(plugin_state_dir(), "snoozed.json")):
-            recover_legacy(load_config())
-        if is_idle(read_state()):
-            # Nothing to do. If a file is there anyway (every entry in it was
-            # malformed and dropped), remove it: while it exists, run.sh starts
-            # Python on every focus change, forever.
-            if os.path.exists(os.path.join(state_dir(), "snoozed.json")):
-                with locked_state():
-                    pass
-            return 0
-        with locked_state() as state:
-            sync(state, load_config(), force="--force" in args)
-        return 0
+        return tick(args)
 
     if command == "toggle":
         config = load_config()
