@@ -383,6 +383,18 @@ RECOVER = {"applied": "recover"}
 
 # What each field of the view record may hold (plan_view reads them all).
 VIEW_FIELDS = {"applied": str, "inherited": (dict, type(None)), "showing": str, "from_pane": (str, type(None))}
+INHERITED_FIELDS = {"source": (str, type(None)), "label": (str, type(None))}
+
+
+def valid_view(view):
+    """Whether a saved view record has only fields of the types plan_view
+    reads, all the way down (a list where a label belongs crashed it)."""
+    if not all(isinstance(view[k], types) for k, types in VIEW_FIELDS.items() if k in view):
+        return False
+    inherited = view.get("inherited")
+    return inherited is None or all(
+        isinstance(inherited[k], types) for k, types in INHERITED_FIELDS.items() if k in inherited
+    )
 
 
 def read_state():
@@ -418,7 +430,7 @@ def read_state():
                 damaged = damaged or len(state[key]) != len(data[key])
         if isinstance(data.get("view"), dict):
             view = dict(data["view"])
-            if all(isinstance(view[k], types) for k, types in VIEW_FIELDS.items() if k in view):
+            if valid_view(view):
                 state["view"] = view
             else:
                 damaged = True  # its fields would crash planning: recover instead
@@ -550,12 +562,48 @@ def recover_legacy(config):
     quiet session isn't left out. A session that isn't running needs nothing:
     its view and tokens died with its server.
 
-    The old file goes only once every running session has recovered; until
-    then (herdr unreachable, a session refusing), it stays and the next hook
-    tries again."""
-    legacy = os.path.join(plugin_state_dir(), "snoozed.json")
+    The old file goes only once every running session has recovered, with
+    every token clear confirmed; until then (herdr unreachable, a session
+    refusing), it stays. One process recovers at a time (the others skip
+    straight past), and after a failure the next attempt waits, doubling
+    from LEGACY_RETRY_S up to LEGACY_RETRY_MAX_S: a refusing session must not
+    turn every hook into seconds of retries. Sessions started with their own
+    HERDR_SOCKET_PATH aren't listed by herdr, so aren't reached (see the
+    README)."""
+    root = plugin_state_dir()
+    legacy = os.path.join(root, "snoozed.json")
     if not os.path.exists(legacy):
         return
+    retry_path = os.path.join(root, "legacy-retry.json")
+    try:
+        with open(retry_path, encoding="utf-8") as handle:
+            retry = json.load(handle)
+        if time.time() < float(retry["at"]):
+            return  # backing off after a failure
+    except (OSError, ValueError, KeyError, TypeError):
+        retry = {}
+    with open(os.path.join(root, "legacy.lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return  # another process is recovering right now
+        complete = _recover_every_session(config)
+        if complete:
+            for path in (legacy, retry_path):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
+        else:
+            delay = min(LEGACY_RETRY_MAX_S, max(LEGACY_RETRY_S, float(retry.get("delay", 0)) * 2))
+            with contextlib.suppress(OSError), open(retry_path, "w", encoding="utf-8") as handle:
+                json.dump({"at": time.time() + delay, "delay": delay}, handle)
+
+
+LEGACY_RETRY_S = 30
+LEGACY_RETRY_MAX_S = 3600
+
+
+def _recover_every_session(config):
+    """Returns True when every running session is known to be recovered."""
     socks = running_sessions()
     complete = socks is not None
     socks = list(socks or [])
@@ -570,16 +618,14 @@ def recover_legacy(config):
                 with locked_state() as state:
                     if is_idle(state):
                         state["view"] = dict(RECOVER)
-                    sync(state, config)
+                    sync(state, config, strict=True)
                 with open(marker, "w", encoding="utf-8") as handle:
                     handle.write("0.1.0 state recovered\n")
                 log("recovered from 0.1.0 in", sock)
             except (OSError, ValueError, HerdrError) as problem:
                 log("0.1.0 recovery not done yet in", sock, "-", problem)
                 complete = False
-    if complete:
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(legacy)
+    return complete
 
 
 # ── reconcile (pure) ─────────────────────────────────────────────────────────
@@ -852,15 +898,20 @@ def focused_pane(panes, agents_only=False):
     )
 
 
-def sync(state, config, force=False):
+def sync(state, config, force=False, strict=False):
+    """Reconcile state with herdr. strict (recovery) raises if herdr refused
+    to clear any token, rather than letting the caller take it as done."""
     panes = call("pane.list").get("panes", [])
     now = now_ms()
     ops = reconcile(state, panes, now, force=force, badge=config["badge"])
-    for op in send_token_ops(ops):
+    failed = send_token_ops(ops)
+    for op in failed:
         # Workspace tokens can't be read back, so nothing else would notice.
         entry = state["workspaces" if op[0].startswith("ws_") else "panes"].get(op[1])
         if entry is not None and op[0] in ("report", "ws_report"):
             entry["dirty"] = True
+    if strict and any(op[0] in ("clear", "ws_clear") for op in failed):
+        raise HerdrError("recovery_incomplete", "herdr refused to clear %d token(s)" % len(failed))
     # Only an *agent* pane counts as "went back to work": a shell, or the
     # picker popup itself taking focus, is not that.
     if config["auto_return"] and settle_showing(state, focused_pane(panes, agents_only=True)):
@@ -881,11 +932,17 @@ def sync(state, config, force=False):
     # only while we hold it ourselves, the one we borrowed it from.
     foreign = owner.get("active") and owner.get("source") != SOURCE
     view_before = copy.deepcopy(state["view"])
-    action = plan_view(
-        state, owner, count,
-        sort_override=config["sort"], badge=config["badge"], views=config["views"], blocked=blocked,
-        owner_off=owner_turned_off(owner if foreign else state["view"].get("inherited")),
-    )
+    try:
+        action = plan_view(
+            state, owner, count,
+            sort_override=config["sort"], badge=config["badge"], views=config["views"], blocked=blocked,
+            owner_off=owner_turned_off(owner if foreign else state["view"].get("inherited")),
+        )
+    except Exception:
+        # Whatever went wrong, never leave the view record half-planned:
+        # "idle" would delete the file with our filter maybe still live.
+        state["view"] = view_before or dict(RECOVER)
+        raise
     if action:
         try:
             call("agent.view.set" if action[0] == "set" else "agent.view.clear", action[1])

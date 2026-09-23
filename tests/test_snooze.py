@@ -760,6 +760,14 @@ class Commands(unittest.TestCase):
         # everyone recovered: the old file goes, and run.sh stops starting Python
         self.assertFalse(os.path.exists(legacy))
 
+    def past_the_backoff(self):
+        path = os.path.join(self.dir.name, "legacy-retry.json")
+        with open(path) as handle:
+            retry = snooze.json.load(handle)
+        retry["at"] = 0
+        with open(path, "w") as handle:
+            snooze.json.dump(retry, handle)
+
     def test_0_1_0_file_stays_until_every_running_session_recovered(self):
         legacy = self.legacy()
         self.second_session(reachable=False)
@@ -767,10 +775,50 @@ class Commands(unittest.TestCase):
         self.assertTrue(os.path.exists(legacy), "removed with a session still unrecovered")
         self.herdr.calls.clear()
         self.b_reachable = True
+        self.past_the_backoff()
         self.assertEqual(snooze.main(["tick"]), 0)
         self.assertEqual(self.herdr_b.view, {"active": False})
         self.assertFalse(os.path.exists(legacy))
         self.assertNotIn("agent.view.clear", self.herdr.calls, "recovered this session again")
+
+    def test_a_refusing_session_is_retried_with_backoff_not_on_every_hook(self):
+        self.legacy()
+        self.second_session(reachable=False)
+        with mock.patch.object(snooze, "running_sessions", wraps=snooze.running_sessions) as listed:
+            snooze.main(["tick"])
+            snooze.main(["tick"])  # straight after: backing off
+            self.assertEqual(listed.call_count, 1, "every hook paid for another recovery attempt")
+        with open(os.path.join(self.dir.name, "legacy-retry.json")) as handle:
+            first = snooze.json.load(handle)["delay"]
+        self.past_the_backoff()
+        snooze.main(["tick"])  # fails again: waits longer
+        with open(os.path.join(self.dir.name, "legacy-retry.json")) as handle:
+            self.assertEqual(snooze.json.load(handle)["delay"], first * 2)
+
+    def test_only_one_process_recovers_at_a_time(self):
+        self.legacy()
+        with open(os.path.join(self.dir.name, "legacy.lock"), "a") as lock:
+            snooze.fcntl.flock(lock, snooze.fcntl.LOCK_EX)  # another process is at it
+            with mock.patch.object(snooze, "running_sessions") as listed:
+                self.assertEqual(snooze.main(["tick"]), 0)
+            listed.assert_not_called()
+
+    def test_a_refused_token_clear_is_not_counted_as_recovered(self):
+        # Round 2c: the clear failed, yet the session was marked done and the
+        # 0.1.0 file removed, leaving that agent hidden.
+        legacy = self.legacy()
+        self.panes[1]["tokens"][snooze.TOKEN] = "z 12:00"
+        real = self.herdr.__call__
+
+        def refuses_clears(method, params=None, timeout=5.0):
+            if method == "pane.report_metadata" and params["tokens"].get(snooze.TOKEN, "x") is None:
+                raise snooze.HerdrError("denied", "not now")
+            return real(method, params, timeout)
+
+        with mock.patch.object(snooze, "call", refuses_clears):
+            snooze.main(["tick"])
+        self.assertTrue(os.path.exists(legacy))
+        self.assertFalse(os.path.exists(os.path.join(snooze.state_dir(), "legacy-recovered")))
 
     def test_0_1_0_file_stays_if_herdr_cant_list_sessions(self):
         legacy = self.legacy()
@@ -792,6 +840,20 @@ class Commands(unittest.TestCase):
         self.assertEqual(snooze.main(["tick"]), 0)
         self.assertEqual(self.herdr.view, {"active": True, "source": RADAR, "label": "active"})
         self.assertFalse(os.path.exists(self.file))
+
+    def test_a_crash_while_planning_never_deletes_the_file(self):
+        # Round 2c: plan_view had already set the view record to idle when
+        # it crashed, so the file went with our filter still live.
+        self.snoozed(snooze.now_ms() - 1000)
+        self.herdr.view = {"active": True, "source": snooze.SOURCE, "label": "z 1"}
+        def clears_then_crashes(state, *args, **kwargs):
+            state["view"] = {}  # what plan_view does before it can fail
+            raise TypeError("boom")
+
+        with mock.patch.object(snooze, "plan_view", side_effect=clears_then_crashes):
+            with self.assertRaises(TypeError):
+                snooze.main(["tick"])
+        self.assertTrue(os.path.exists(self.file))
 
     def test_failed_last_clear_keeps_the_file_so_the_next_tick_retries(self):
         # The last snooze has ended; clearing our view is all that's left.
@@ -986,7 +1048,9 @@ class StateFile(unittest.TestCase):
 
     def test_nested_view_fields_of_the_wrong_type_are_damage(self):
         # Round 2b: {"applied": 7} made planning crash on every hook.
-        for view in ({"applied": 7}, {"inherited": "radar"}, {"showing": 1}, {"from_pane": []}):
+        for view in ({"applied": 7}, {"inherited": "radar"}, {"showing": 1}, {"from_pane": []},
+                     {"applied": "recover", "inherited": {"source": RADAR, "label": []}},  # round 2c
+                     {"inherited": {"source": 5}}):
             with self.subTest(view=view):
                 with open(self.path, "w") as handle:
                     handle.write(snooze.json.dumps({"panes": {}, "workspaces": {}, "view": view}))

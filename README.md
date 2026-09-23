@@ -318,6 +318,17 @@ may have left hidden there, through each session's own socket. Agents snoozed
 under 0.1.0 therefore come back once on upgrade; snooze them again. The old
 file is removed once every running session has been cleaned up.
 
+If a session can't be reached or refuses, the old file stays and the upgrade
+cleanup is retried later, backing off from 30 seconds up to an hour, so it
+never slows every event down.
+
+What the upgrade can't cover: herdr servers started with their own
+`HERDR_SOCKET_PATH` (herdr's session list doesn't include them), sessions run
+with different `XDG_STATE_HOME` values, and a `badge` changed between 0.1.0
+and 0.1.1 (snooze then can't recognise its old tokens). If agents stay hidden
+after upgrading in one of those setups, run **Wake all snoozed agents** in that
+session: it clears snooze's view and its tokens there.
+
 Token names aren't owned in herdr, so snooze only ever clears a `snoozed` token
 whose value it could have written (it starts with snooze's badge); another
 plugin's token of the same name is left alone. With an empty `badge` in
