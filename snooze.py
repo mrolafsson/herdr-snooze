@@ -202,8 +202,20 @@ def config_dir():
     return os.path.join(base, "herdr", "plugins", "config", PLUGIN_ID)
 
 
+# herdr's agent-view sort, as agent.view.set accepts it (src/api/schema/agents.rs):
+# anything else and herdr refuses the whole view, on every sync.
+SORT_FIELDS = {"workspace_order", "tab_order", "pane_order", "attention", "status", "agent", "seen", "state_change_seq"}
+
+
+def _sort_key_ok(key):
+    field = key.get("field") if isinstance(key, dict) else None
+    token = field.get("token") if isinstance(field, dict) and len(field) == 1 else None
+    named = isinstance(field, str) and field in SORT_FIELDS
+    return (named or isinstance(token, str)) and key.get("order", "asc") in ("asc", "desc")
+
+
 def _sort_ok(value):
-    return isinstance(value, list) and all(isinstance(s, dict) for s in value)
+    return isinstance(value, list) and all(_sort_key_ok(key) for key in value)
 
 
 # Each setting: its default, and what a valid value looks like. A wrong value
@@ -706,6 +718,7 @@ def reconcile(state, panes, now, force=False, badge=DEFAULT_BADGE):
     ops = []
     live = {pane["pane_id"]: pane for pane in panes}
     live_workspaces = {pane.get("workspace_id") for pane in panes}
+    follow_terminals(state, panes, live)
 
     for wid in list(state["workspaces"]):
         space = state["workspaces"][wid]
@@ -728,7 +741,10 @@ def reconcile(state, panes, now, force=False, badge=DEFAULT_BADGE):
             if not pane.get("agent"):
                 continue
             if pane.get("workspace_id") == wid and pid not in state["panes"] and pid not in space.get("except", []):
-                state["panes"][pid] = {"until": space["until"], "via": "workspace", "workspace_id": wid, "dirty": True}
+                state["panes"][pid] = {
+                    "until": space["until"], "via": "workspace", "workspace_id": wid, "dirty": True,
+                    "agent_id": agent_identity(pane), "terminal_id": pane.get("terminal_id"),
+                }
         # Workspace tokens are not visible from pane.list, so only the clock
         # (or a forced pass after a server restart) can say one needs sending.
         if _token_due(space, now, present=not force):
@@ -747,11 +763,18 @@ def reconcile(state, panes, now, force=False, badge=DEFAULT_BADGE):
             del state["panes"][pid]
             continue
         if replaced(entry, pane):
-            # The agent that was snoozed exited and another started in the same
-            # pane: the snooze was for that one, not this.
-            ops.append(("clear", pid))
-            del state["panes"][pid]
-            continue
+            space = state["workspaces"].get(entry.get("workspace_id"))
+            if entry.get("via") == "workspace" and space is not None:
+                # A snoozed space covers whatever agent runs in it: keep it
+                # hidden, as this agent's own record.
+                entry["agent_id"] = agent_identity(pane)
+                entry.pop("agent_gone", None)
+            else:
+                # The agent that was snoozed exited and another started in
+                # the same pane: the snooze was for that one, not this.
+                ops.append(("clear", pid))
+                del state["panes"][pid]
+                continue
         present = MARK in (pane.get("tokens") or {})
         if _token_due(entry, now, present=present and not force):
             ops.append(_token_op("report", pid, entry, now, badge))
@@ -776,34 +799,76 @@ def looks_ours(value, badge):
     return not badge or str(value).startswith(badge)
 
 
+def follow_terminals(state, panes, live):
+    """herdr gives a pane moved to another space or tab a new ID, but it keeps
+    its terminal. Re-key what we hold for it by terminal_id, so the snooze (or
+    a wake-up exception) follows the pane from whatever pane.list shows,
+    whatever order concurrent hooks run in, and however many moves ago.
+    Mutates `state`; everything learns its terminal while its pane is live."""
+    by_terminal = {pane["terminal_id"]: pane for pane in panes if pane.get("terminal_id")}
+    for pid in list(state["panes"]):
+        entry = state["panes"][pid]
+        pane = live.get(pid)
+        if pane is not None:
+            if pane.get("terminal_id"):
+                entry["terminal_id"] = pane["terminal_id"]
+            continue
+        pane = by_terminal.get(entry.get("terminal_id"))
+        if pane is None:
+            continue  # closed: reconcile forgets it
+        del state["panes"][pid]
+        new = pane["pane_id"]
+        if new in state["panes"]:
+            continue  # it already has a record of its own
+        if entry.get("via") == "workspace" and pane.get("workspace_id") != entry.get("workspace_id"):
+            entry["via"] = "pane"  # it left the snoozed space: it keeps its own deadline
+        entry["workspace_id"] = pane.get("workspace_id")
+        entry["dirty"] = True  # the token may not have come along
+        state["panes"][new] = entry
+    for space in state["workspaces"].values():
+        if not space.get("except"):
+            continue
+        known = space.get("except_terminals") if isinstance(space.get("except_terminals"), dict) else {}
+        kept, terminals = [], {}
+        for pid in space["except"]:
+            pane = live.get(pid) or by_terminal.get(known.get(pid))
+            if pane is None:
+                continue  # closed: nothing left to except
+            if pane["pane_id"] not in kept:
+                kept.append(pane["pane_id"])
+            if pane.get("terminal_id"):
+                terminals[pane["pane_id"]] = pane["terminal_id"]
+        space["except"], space["except_terminals"] = kept, terminals
+
+
 def agent_identity(pane):
-    """Which agent runs in a pane: its kind, and the session herdr reports for
-    it when it has one. None when there's no agent."""
-    if not pane.get("agent"):
-        return None
-    session = pane.get("agent_session")
-    return {"agent": pane.get("agent"), "session": session.get("value") if isinstance(session, dict) else None}
+    """Which kind of agent runs in a pane, or None when there's no agent."""
+    return {"agent": pane["agent"]} if pane.get("agent") else None
 
 
 def replaced(entry, pane):
-    """Whether the agent in the pane is not the one that was snoozed. A
-    record from before 0.2 (no identity) adopts the current agent; one that
-    only knew the agent's kind learns its session when herdr reports it. With
-    no session reported, a new agent of the same kind can't be told apart."""
+    """Whether the agent in the pane is not the one that was snoozed: another
+    kind, or any agent after this pane was seen with none.
+
+    pane.list carries no process identity, and agent_session changes on the
+    same agent's /clear, resume and compact, so neither can tell. What herdr
+    does give: it clears `agent` when the agent exits (its shell is back in
+    the foreground), and also after several missed probes while something
+    else holds the foreground. So an agent that hands its terminal to an
+    editor for a while loses its snooze and shows again; the other way round,
+    a newly started agent would stay hidden. A record from before 0.2 (no
+    identity) adopts the agent it finds."""
     current = agent_identity(pane)
-    recorded = entry.get("agent_id")
     if current is None:
-        return False  # the agent exited: the record hides nothing until one returns
+        entry["agent_gone"] = True  # it hides nothing until an agent returns
+        return False
+    if entry.get("agent_gone"):
+        return True
+    recorded = entry.get("agent_id")
     if not isinstance(recorded, dict):
         entry["agent_id"] = current
         return False
-    if recorded.get("agent") != current["agent"]:
-        return True
-    if recorded.get("session") and current["session"] and recorded["session"] != current["session"]:
-        return True
-    if not recorded.get("session") and current["session"]:
-        entry["agent_id"] = current
-    return False
+    return recorded.get("agent") != current["agent"]
 
 
 def known_sort(owner, views=None):
@@ -943,10 +1008,14 @@ def probe_view():
     return call("agent.view.clear", {"source": SOURCE + ".probe"})
 
 
+TIMER_SCRIPT = 'sleep "$1" && exec /bin/sh "$2" tick'
+
+
 def _spawn_timer(delay_s):
+    """Starts the sleeper and returns its PID (arm_timer keeps it)."""
     launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
-    subprocess.Popen(
-        [TIMER_SHELL, "-c", 'sleep "$1" && exec /bin/sh "$2" tick', TIMER_NAME, str(delay_s), launcher],
+    return subprocess.Popen(
+        [TIMER_SHELL, "-c", TIMER_SCRIPT, TIMER_NAME, str(delay_s), launcher],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, close_fds=True,
     ).pid
@@ -976,9 +1045,12 @@ def timer_alive(pid):
 
 
 def is_our_timer(pid):
+    """Whether the process is one of our sleepers: its whole command line, not
+    a word in it, before we'd stop its process group."""
+    signature = "%s -c %s %s " % (TIMER_SHELL, TIMER_SCRIPT, TIMER_NAME)
     try:
         out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
-        return TIMER_NAME in out.stdout
+        return out.stdout.startswith(signature)
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -1090,43 +1162,6 @@ def sync(state, config, force=False, strict=False):
     return panes
 
 
-def moved_pane(event):
-    """The pane_moved payload in a hook's event JSON ({previous_pane_id,
-    previous_workspace_id, pane}), wherever herdr nests it, or None."""
-    if isinstance(event, dict):
-        if isinstance(event.get("previous_pane_id"), str) and isinstance(event.get("pane"), dict):
-            return event
-        for value in event.values():
-            found = moved_pane(value)
-            if found:
-                return found
-    return None
-
-
-def follow_move(state, move):
-    """A pane moved to another space keeps its terminal but gets a new ID:
-    carry its snooze over, or the next tick would forget it as closed and wake
-    it early. Returns True if anything changed."""
-    previous, pane = move["previous_pane_id"], move["pane"]
-    new = pane.get("pane_id")
-    if not new or new == previous:
-        return False
-    changed = False
-    if previous in state["panes"]:
-        entry = state["panes"].pop(previous)
-        if entry.get("via") == "workspace" and pane.get("workspace_id") != move.get("previous_workspace_id"):
-            entry["via"] = "pane"  # it left the snoozed space: it keeps its own deadline
-        entry["workspace_id"] = pane.get("workspace_id")
-        entry["dirty"] = True  # the token may not have come along
-        state["panes"][new] = entry
-        changed = True
-    for space in state["workspaces"].values():
-        if previous in space.get("except", []):
-            space["except"] = [new if p == previous else p for p in space["except"]]
-            changed = True
-    return changed
-
-
 def snooze(kind, target, until, config, expect_agent=None):
     """kind is 'pane' or 'workspace'. Returns how many panes are now covered.
 
@@ -1147,9 +1182,12 @@ def snooze(kind, target, until, config, expect_agent=None):
                 pane = next((p for p in call("pane.list").get("panes", []) if p["pane_id"] == target), None)
                 if pane is None:
                     raise ValueError("that pane moved or closed; open snooze on it again")
+                if agent_identity(pane) is None:
+                    raise ValueError("the agent there has exited; open snooze on it again")
                 if replaced({"agent_id": expect_agent}, pane):
                     raise ValueError("a different agent is running there now; open snooze on it again")
-                record["agent_id"] = agent_identity(pane) or expect_agent
+                record["agent_id"] = agent_identity(pane)
+                record["terminal_id"] = pane.get("terminal_id")
             state["panes"][target] = record
             # Its own deadline now outranks its space's: without this, a shorter
             # snooze ends, the agent reappears, and the space re-adopts it a
@@ -1483,49 +1521,52 @@ USAGE = """usage: snooze.py <command>
   list"""
 
 
-def hook_event():
+def _try_lock(handle):
     try:
-        return json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "null")
-    except ValueError:
-        return None
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
 
 
 def tick(args):
     """What every hook runs. Hooks fire in bursts (each focus change, each
-    status flip): a plain tick that finds another one running leaves a note
-    and exits, and the running one goes once more — a burst is a couple of
-    passes, not a queue of processes each waiting on the lock and on herdr.
-    A tick that carries something (a pane move, the startup --force) waits
-    its turn instead: what it carries would be lost."""
-    move = moved_pane(hook_event())
+    status flip, all at once: herdr runs them concurrently): a tick that
+    finds another one running leaves a note and exits, and the running one
+    goes again — a burst is a couple of passes, not a queue of processes each
+    waiting on the lock and on herdr. Every pass reads everything from herdr,
+    so no tick carries anything a later pass would miss. The startup --force
+    runs regardless: it resets what a restart left behind.
+
+    No note is ever stranded: the runner looks again after unlocking, and a
+    tick that left a note tries the lock once more, so either the note's
+    writer runs or the lock's holder will see the note after unlocking."""
     root = state_dir()
-    if move or "--force" in args or not os.path.isdir(root):
-        return _tick_once(args, move)
+    if "--force" in args or not os.path.isdir(root):
+        return _tick_once(args)
     pending = os.path.join(root, "tick.pending")
     with open(os.path.join(root, "tick.lock"), "a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            with open(pending, "a"):
-                pass
-            return 0
-        for _ in range(3):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(pending)
-            _tick_once(args, None)
+        while True:
+            if not _try_lock(lock):
+                with open(pending, "a"):
+                    pass
+                if not _try_lock(lock):
+                    return 0  # its holder hasn't unlocked yet: it will see the note
+            while True:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(pending)
+                _tick_once(args)
+                if not os.path.exists(pending):
+                    break
+            fcntl.flock(lock, fcntl.LOCK_UN)
             if not os.path.exists(pending):
-                break
-    return 0
+                return 0
 
 
-def _tick_once(args, move):
+def _tick_once(args):
     prune_stale_sessions()
     if os.path.exists(os.path.join(plugin_state_dir(), "snoozed.json")):
         recover_legacy(load_config())
-    if move and read_state()["panes"]:
-        with locked_state() as state:
-            if follow_move(state, move):
-                log("followed a moved pane:", move["previous_pane_id"], "->", move["pane"].get("pane_id"))
     if is_idle(read_state()):
         # Nothing to do. If a file is there anyway (every entry in it was
         # malformed and dropped), remove it: while it exists, run.sh starts

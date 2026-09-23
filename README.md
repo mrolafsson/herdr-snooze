@@ -178,11 +178,17 @@ Durations are real elapsed time: `2h` is two hours even across a daylight-saving
 change, while a clock time like `9am` stays 9am.
 
 **A snooze belongs to the agent you snoozed.** If that agent exits and another
-starts in the same pane, the new one isn't hidden. Moving a pane to another
-space keeps its snooze. If the picker was left open while its pane moved,
-closed or got a new agent, it says so instead of snoozing the wrong thing.
-(With an agent that doesn't report a session to herdr, a new agent of the same
-kind in the same pane can't be told apart from the old one.)
+starts in the same pane, the new one isn't hidden (in a snoozed space it is:
+the space covers whatever runs in it). The same agent keeps its snooze through
+`/clear`, a resume or a compaction. Moving a pane to another space or tab keeps
+its snooze. If the picker was left open while its pane moved, closed or got a
+new agent, it says so instead of snoozing the wrong thing.
+
+herdr tells snooze only which kind of agent runs in a pane, not which process,
+so "exited" means herdr showed the pane without an agent. herdr also does that
+when an agent hands the terminal to another program (an editor it opened, say)
+for more than a few seconds. That agent then loses its snooze and reappears. It
+never works the other way: a new agent is never hidden by an old snooze.
 
 **Sharing the Agents panel.** herdr has one agent view, and the last plugin to
 set it wins. While something is snoozed, snooze keeps its view in place,
@@ -273,6 +279,10 @@ Then, by hand:
   rm -f ~/.config/herdr/.herdr-snooze-session ~/.config/herdr/sessions/*/.herdr-snooze-session*
   ```
 
+  If you ran herdr on a socket of your own (`HERDR_SOCKET_PATH`), the file is
+  next to that socket, named after it: for `/tmp/team.sock`, remove
+  `/tmp/.herdr-snooze-session-team.sock`.
+
 If you uninstall while agents are still snoozed, nothing breaks: herdr drops the
 plugin's panel filter immediately, so every agent is visible again, and the
 leftover `snoozed` tokens expire on their own within 24 hours. A plugin that
@@ -323,9 +333,11 @@ A small state file, `snoozed.json` in the plugin's state directory, holds the
 real deadlines, and which agent each one is for. `tick` — a startup hook plus
 a few event hooks — reconciles what a TTL alone cannot: herdr caps a token's
 TTL at 24h, tokens and the view do not survive a server restart, another plugin
-can replace the view, and a pane that moves gets a new ID. Hooks fire in
-bursts, so a tick that finds another one running leaves a note and exits, and
-the running one goes once more.
+can replace the view, and a pane that moves gets a new ID (it keeps its
+terminal, which is how snooze finds it again). herdr runs hooks concurrently and
+in bursts, so a tick that finds another one running leaves a note and exits, and
+the running one goes again until no note is left. Every tick reads everything
+from herdr, so it doesn't matter which hook's tick does the work.
 
 Between events, one detached `sleep` runs a tick at the next moment something
 needs doing, and at least every five minutes while anything is snoozed. It
@@ -335,11 +347,13 @@ one replaced by an earlier deadline is stopped.
 
 Each herdr session has its own state, in `sessions/<key>/` under the plugin's
 state directory, since pane IDs only mean something inside one session. The key
-comes from the session's socket and a random ID snooze keeps in the session's
-own directory (`.herdr-snooze-session`). A restart keeps that directory and so
-its snoozes; deleting a named session removes it, so a new session with the
-same name (whose panes herdr numbers from `w1:p1` again) never picks up the old
-one's snoozes. State left by a session that no longer exists is removed.
+comes from the session's socket and a random ID snooze keeps next to it
+(`.herdr-snooze-session` in the session's directory; for a socket not named
+`herdr.sock`, a file named after the socket). A server restart keeps that file
+and so the session's snoozes. Deleting a named session deletes its directory
+with the file, so a new session with the same name (whose panes herdr numbers
+from `w1:p1` again) never picks up the old one's snoozes. State left by a
+session that no longer exists is removed.
 
 **Upgrading from 0.1.0**, which kept one file for every session: no session
 can know whose records those were, so none adopts them. Instead the first

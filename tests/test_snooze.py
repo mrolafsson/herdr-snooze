@@ -23,7 +23,14 @@ def live_token(value="z"):
 
 
 def pane(pid, workspace="w1", agent="claude", tokens=None):
-    return {"pane_id": pid, "workspace_id": workspace, "agent": agent, "tokens": tokens or {}}
+    # herdr always sends terminal_id; it stays with the pane when it moves.
+    return {"pane_id": pid, "terminal_id": "t-" + pid, "workspace_id": workspace, "agent": agent, "tokens": tokens or {}}
+
+
+def moved(p, pid, workspace):
+    """The same pane after a move: a new ID (and maybe space), the same terminal."""
+    p.update({"pane_id": pid, "workspace_id": workspace})
+    return p
 
 
 def state(panes=None, workspaces=None, view=None):
@@ -175,31 +182,40 @@ class Reconcile(unittest.TestCase):
         p["agent_session"] = {"agent": agent, "kind": "id", "source": "x", "value": session} if session else None
         return p
 
-    def test_a_new_agent_in_the_pane_does_not_inherit_the_snooze(self):
-        # v0.2: agent A exits, agent B starts in the same pane; the snooze was A's.
-        st = state({"p1": {"until": self.now + HOUR, "token_until": self.now + HOUR,
-                           "agent_id": {"agent": "claude", "session": "s-a"}}})
+    def snoozed_claude(self, **extra):
+        return state({"p1": dict({"until": self.now + HOUR, "token_until": self.now + HOUR,
+                                  "agent_id": {"agent": "claude"}}, **extra)})
+
+    def test_a_new_agent_after_the_old_one_exited_does_not_inherit_the_snooze(self):
+        # v0.2: agent A exits (herdr shows the pane with no agent), agent B
+        # starts in the same pane; the snooze was A's.
+        st = self.snoozed_claude()
+        self.assertEqual(snooze.reconcile(st, [pane("p1", agent=None, tokens=live_token())], self.now), [])
+        self.assertIn("p1", st["panes"], "the record hides nothing while no agent runs: kept")
         self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-b")], self.now), [("clear", "p1")])
         self.assertEqual(st["panes"], {})
 
-    def test_same_agent_keeps_its_snooze_and_learns_its_session(self):
-        st = state({"p1": {"until": self.now + HOUR, "token_until": self.now + HOUR,
-                           "agent_id": {"agent": "claude", "session": None}}})
-        self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-a")], self.now), [])
-        self.assertEqual(st["panes"]["p1"]["agent_id"], {"agent": "claude", "session": "s-a"})
-        self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-a")], self.now), [])
+    def test_clear_resume_and_compact_keep_the_snooze(self):
+        # Round 3: herdr gives the same running agent a new agent_session on
+        # /clear, resume and compact; 0.2's first cut took that for a new agent.
+        st = self.snoozed_claude()
+        for session in ("s-a", "s-after-clear", None, "s-resumed"):
+            self.assertEqual(snooze.reconcile(st, [self.with_session("p1", session)], self.now), [], session)
+        self.assertIn("p1", st["panes"])
 
     def test_another_kind_of_agent_is_a_new_agent(self):
-        st = state({"p1": {"until": self.now + HOUR, "token_until": self.now + HOUR,
-                           "agent_id": {"agent": "claude", "session": None}}})
+        st = self.snoozed_claude()
         self.assertEqual(snooze.reconcile(st, [self.with_session("p1", None, agent="codex")], self.now), [("clear", "p1")])
 
-    def test_agent_exiting_keeps_the_record_until_one_returns(self):
-        st = state({"p1": {"until": self.now + HOUR, "token_until": self.now + HOUR,
-                           "agent_id": {"agent": "claude", "session": "s-a"}}})
-        shell = pane("p1", agent=None, tokens=live_token())
-        self.assertEqual(snooze.reconcile(st, [shell], self.now), [])
-        self.assertIn("p1", st["panes"])
+    def test_a_new_agent_in_a_snoozed_space_stays_hidden(self):
+        # The space covers whatever runs in it: no clear-and-re-adopt flicker.
+        st = state({"p1": {"until": self.now + HOUR, "token_until": self.now + HOUR, "via": "workspace",
+                           "workspace_id": "w1", "agent_id": {"agent": "claude"}}},
+                   {"w1": {"until": self.now + HOUR, "token_until": self.now + HOUR}})
+        snooze.reconcile(st, [pane("p1", agent=None, tokens=live_token())], self.now)
+        self.assertEqual(snooze.reconcile(st, [pane("p1", agent="codex", tokens=live_token())], self.now), [])
+        self.assertEqual(st["panes"]["p1"]["agent_id"], {"agent": "codex"})
+        self.assertNotIn("agent_gone", st["panes"]["p1"])
 
     def test_a_0_1_record_adopts_its_agent_and_gets_the_marker(self):
         # upgrading: no identity recorded, and the token has no MARK yet
@@ -208,7 +224,51 @@ class Reconcile(unittest.TestCase):
         p["tokens"] = {"snoozed": "z 12:00"}
         ops = snooze.reconcile(st, [p], self.now)
         self.assertEqual([op[0] for op in ops], ["report"])  # re-reported, now with MARK
-        self.assertEqual(st["panes"]["p1"]["agent_id"], {"agent": "claude", "session": "s-a"})
+        self.assertEqual(st["panes"]["p1"]["agent_id"], {"agent": "claude"})
+        self.assertEqual(st["panes"]["p1"]["terminal_id"], "t-p1")
+
+    # ── v0.2: a moved pane gets a new ID and keeps its terminal ──
+
+    def test_a_moved_pane_keeps_its_snooze_whatever_the_hook_order(self):
+        # Round 3: a plain tick that saw the move before the move hook ran
+        # forgot the record as closed. Now any pass finds it by terminal.
+        st = self.snoozed_claude(via="pane", workspace_id="w1", terminal_id="t-p1")
+        p = moved(pane("p1", tokens={}), "w2:p1", "w2")  # the token stayed behind
+        ops = snooze.reconcile(st, [p], self.now)
+        self.assertEqual(list(st["panes"]), ["w2:p1"])
+        self.assertEqual([op[:2] for op in ops], [("report", "w2:p1")], "hidden again under its new ID")
+        self.assertEqual(st["panes"]["w2:p1"]["workspace_id"], "w2")
+
+    def test_two_quick_moves_in_any_order(self):
+        # A → B → C with no pass in between (or the B hook running last):
+        # only C is live, and the snooze lands there.
+        st = self.snoozed_claude(via="pane", workspace_id="w1", terminal_id="t-p1")
+        c = moved(pane("p1"), "C", "w3")
+        snooze.reconcile(st, [c], self.now)
+        self.assertEqual(list(st["panes"]), ["C"])
+        snooze.reconcile(st, [c], self.now)  # the late hooks for A → B and B → C
+        self.assertEqual(list(st["panes"]), ["C"])
+
+    def test_leaving_a_snoozed_space_keeps_its_own_deadline(self):
+        st = state({"p1": {"until": self.now + HOUR, "via": "workspace", "workspace_id": "w1", "terminal_id": "t-p1"}},
+                   {"w1": {"until": self.now + HOUR, "token_until": self.now + HOUR}})
+        snooze.reconcile(st, [pane("stay"), moved(pane("p1"), "w2:p1", "w2")], self.now)
+        self.assertEqual(st["panes"]["w2:p1"]["via"], "pane")
+
+    def test_a_woken_pane_stays_woken_when_it_moves_within_its_space(self):
+        # Woken early out of a snoozed space, then moved to another tab of it:
+        # a new ID that isn't on the except list would be re-adopted, hidden.
+        st = state(workspaces={"w1": {"until": self.now + HOUR, "token_until": self.now + HOUR, "except": ["p1"]}})
+        snooze.reconcile(st, [pane("p1"), pane("other")], self.now)  # learns p1's terminal
+        st["panes"].pop("other")
+        snooze.reconcile(st, [moved(pane("p1"), "p1-tab2", "w1")], self.now)
+        self.assertNotIn("p1-tab2", st["panes"])
+        self.assertEqual(st["workspaces"]["w1"]["except"], ["p1-tab2"])
+
+    def test_a_closed_pane_is_not_mistaken_for_a_moved_one(self):
+        st = self.snoozed_claude(terminal_id="t-p1")
+        self.assertEqual(snooze.reconcile(st, [pane("p2")], self.now), [])
+        self.assertEqual(st["panes"], {})
 
     def test_another_plugins_token_of_the_same_name_is_left_alone(self):
         # token names aren't owned in herdr: only a value we'd write is ours
@@ -518,25 +578,27 @@ class ArmTimer(unittest.TestCase):
             subprocess.run(["ps", "-o", "command=", "-p", str(os.getpid())], capture_output=True, check=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
             self.skipTest("ps isn't available here (a sandbox)")
-        # The same shape as _spawn_timer's command: a compound one keeps the
-        # shell (and its $0 name) alive; `sh -c "sleep 30"` alone would exec
-        # sleep in its place and lose the name.
-        ours = subprocess.Popen([snooze.TIMER_SHELL, "-c", "sleep 30 && true", snooze.TIMER_NAME], start_new_session=True)
-        other = subprocess.Popen(["/bin/sh", "-c", "sleep 30 && true", "not-snooze"], start_new_session=True)
+        # The real launcher, so this tests the contract rather than a copy of
+        # it. The imposter even borrows our $0 name, but runs something else.
+        pid = snooze._spawn_timer(30)
+        self.assertIsInstance(pid, int)
+        other = subprocess.Popen(["/bin/sh", "-c", "sleep 30 && true", snooze.TIMER_NAME], start_new_session=True)
         try:
-            self.assertTrue(snooze.timer_alive(ours.pid))
-            self.assertTrue(snooze.is_our_timer(ours.pid))
+            self.assertTrue(snooze.timer_alive(pid))
+            self.assertTrue(snooze.is_our_timer(pid))
             self.assertFalse(snooze.is_our_timer(other.pid))
             snooze.stop_timer(other.pid)  # a reused PID: must survive
-            snooze.stop_timer(ours.pid)
-            self.assertIsNotNone(ours.wait(timeout=5))
+            snooze.stop_timer(pid)
+            _, status = os.waitpid(pid, 0)  # our child: reap it, or it lingers as a zombie
+            self.assertTrue(os.WIFSIGNALED(status))
             self.assertIsNone(other.poll(), "stopped someone else's process")
-            self.assertFalse(snooze.timer_alive(ours.pid))
         finally:
-            for p in (ours, other):
-                with contextlib.suppress(OSError):
-                    p.kill()
-                p.wait()
+            with contextlib.suppress(OSError):
+                os.killpg(pid, 9)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            other.kill()
+            other.wait()
 
     def test_nothing_snoozed_disarms(self):
         st = state()
@@ -791,31 +853,47 @@ class Commands(unittest.TestCase):
 
     # ── v0.2: moved panes, a stale picker, bursts of hooks ──
 
-    def test_a_moved_pane_keeps_its_snooze(self):
+    def test_a_moved_pane_keeps_its_snooze_even_if_a_plain_tick_sees_it_first(self):
+        # Round 3: herdr runs hooks concurrently. A focus tick that reads
+        # pane.list after the move, before the move hook, used to forget the
+        # record as closed. No hook carries the move now: any tick finds it.
         self.snoozed(snooze.now_ms() + HOUR)
-        snooze.main(["tick"])
-        moved = self.panes[1]
-        moved.update({"pane_id": "w2:zz", "workspace_id": "w2", "tokens": {}})  # new ID; the token stayed behind
-        event = {"type": "pane_moved", "previous_pane_id": "zz", "previous_workspace_id": "w1", "pane": dict(moved)}
-        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": snooze.json.dumps(event)}):
-            self.assertEqual(snooze.main(["tick"]), 0)
+        snooze.main(["tick"])  # learns zz's terminal
+        p = moved(self.panes[1], "w2:zz", "w2")
+        p["tokens"] = {}  # the token stayed behind
+        self.assertEqual(snooze.main(["tick"]), 0)  # a focus tick, no event
         self.assertEqual(list(snooze.read_state()["panes"]), ["w2:zz"])
-        self.assertIn(snooze.MARK, moved["tokens"], "hidden again under its new ID")
+        self.assertIn(snooze.MARK, p["tokens"], "hidden again under its new ID")
+
+    def pick(self, target, shown):
+        snooze.snooze("pane", target, datetime.now() + snooze.timedelta(hours=1), dict(SyncAgainstFakeHerdr.config),
+                      expect_agent=shown)
 
     def test_the_picker_refuses_a_pane_whose_agent_changed(self):
-        self.panes[1]["agent_session"] = {"agent": "claude", "kind": "id", "source": "x", "value": "s-new"}
-        shown = {"agent": "claude", "session": "s-old"}
+        self.panes[1]["agent"] = "codex"
         with self.assertRaises(ValueError):
-            snooze.snooze("pane", "zz", datetime.now() + snooze.timedelta(hours=1), dict(SyncAgainstFakeHerdr.config), expect_agent=shown)
+            self.pick("zz", {"agent": "claude"})
         with self.assertRaises(ValueError):  # moved or closed since the picker opened
-            snooze.snooze("pane", "gone", datetime.now() + snooze.timedelta(hours=1), dict(SyncAgainstFakeHerdr.config), expect_agent=shown)
+            self.pick("gone", {"agent": "claude"})
+        self.panes[1]["agent"] = None
+        with self.assertRaises(ValueError):  # exited since
+            self.pick("zz", {"agent": "claude"})
         self.assertEqual(snooze.read_state()["panes"], {})
 
     def test_the_picker_snoozes_the_agent_it_showed(self):
-        self.panes[1]["agent_session"] = {"agent": "claude", "kind": "id", "source": "x", "value": "s-a"}
-        snooze.snooze("pane", "zz", datetime.now() + snooze.timedelta(hours=1), dict(SyncAgainstFakeHerdr.config),
-                      expect_agent={"agent": "claude", "session": "s-a"})
-        self.assertEqual(snooze.read_state()["panes"]["zz"]["agent_id"], {"agent": "claude", "session": "s-a"})
+        # a 0.2-first-cut picker's identity (with a session) still matches
+        self.panes[1]["agent_session"] = {"agent": "claude", "kind": "id", "source": "x", "value": "s-new"}
+        self.pick("zz", {"agent": "claude", "session": "s-old"})
+        record = snooze.read_state()["panes"]["zz"]
+        self.assertEqual((record["agent_id"], record["terminal_id"]), ({"agent": "claude"}, "t-zz"))
+
+    def counting_ticks(self):
+        runs, real = [], snooze._tick_once
+
+        def once(args):
+            runs.append(1)
+            return real(args)
+        return runs, mock.patch.object(snooze, "_tick_once", once)
 
     def test_a_burst_of_ticks_coalesces(self):
         self.snoozed(snooze.now_ms() + HOUR)
@@ -826,17 +904,63 @@ class Commands(unittest.TestCase):
             self.assertEqual(snooze.main(["tick"]), 0)
             self.assertEqual(self.herdr.calls, [], "queued up behind the running tick")
             self.assertTrue(os.path.exists(os.path.join(root, "tick.pending")))
-        runs = []
-        real = snooze._tick_once
-
-        def once(args, move):
-            runs.append(1)
-            return real(args, move)
-
-        with mock.patch.object(snooze, "_tick_once", once):
+        runs, patch = self.counting_ticks()
+        with patch:
             snooze.main(["tick"])  # the pending note from the burst: one more pass
         self.assertEqual(len(runs), 1)
         self.assertFalse(os.path.exists(os.path.join(root, "tick.pending")))
+
+    def test_a_note_left_as_the_runner_unlocks_is_not_stranded(self):
+        # Round 3: a tick failing the lock after the runner's last look but
+        # before its unlock left a note nobody read. Simulated at the exact
+        # boundary: the note appears as the runner lets go of the lock.
+        self.snoozed(snooze.now_ms() + HOUR)
+        pending = os.path.join(snooze.state_dir(), "tick.pending")
+        real_flock, notes = snooze.fcntl.flock, [1]
+
+        def flock(handle, op):
+            if op == snooze.fcntl.LOCK_UN and notes:
+                notes.pop()
+                open(pending, "a").close()
+            return real_flock(handle, op)
+        runs, patch = self.counting_ticks()
+        with patch, mock.patch.object(snooze.fcntl, "flock", flock):
+            snooze.main(["tick"])
+        self.assertEqual(len(runs), 2, "the late note got its pass")
+        self.assertFalse(os.path.exists(pending))
+
+    def test_a_long_burst_is_not_cut_short(self):
+        # Round 3: 0.2's first cut stopped after three passes, leaving the
+        # rest of a burst to the 5-minute safety tick.
+        self.snoozed(snooze.now_ms() + HOUR)
+        pending = os.path.join(snooze.state_dir(), "tick.pending")
+        runs, real = [], snooze._tick_once
+
+        def once(args):
+            runs.append(1)
+            if len(runs) < 5:
+                open(pending, "a").close()  # another hook arrived during this pass
+            return real(args)
+        with mock.patch.object(snooze, "_tick_once", once):
+            snooze.main(["tick"])
+        self.assertEqual(len(runs), 5)
+        self.assertFalse(os.path.exists(pending))
+
+    def test_a_tick_that_leaves_a_note_after_the_runner_quit_runs_itself(self):
+        # The note's writer tries the lock once more: if the runner already
+        # left, nobody else would read the note.
+        self.snoozed(snooze.now_ms() + HOUR)
+        real_flock, calls = snooze.fcntl.flock, []
+
+        def flock(handle, op):
+            calls.append(op)
+            if len(calls) == 1:
+                raise BlockingIOError  # held at the first try, free by the second
+            return real_flock(handle, op)
+        runs, patch = self.counting_ticks()
+        with patch, mock.patch.object(snooze.fcntl, "flock", flock):
+            snooze.main(["tick"])
+        self.assertEqual(len(runs), 1)
 
     def test_toggle_there_and_back(self):
         self.snoozed(snooze.now_ms() + HOUR)
@@ -1078,6 +1202,21 @@ class Config(unittest.TestCase):
         self.assertEqual(config["durations"], snooze.DEFAULT_DURATIONS)
         self.assertFalse(config["auto_return"])  # the valid one is kept
         self.assertGreaterEqual(self.log.call_count, 5)
+
+    def test_sort_keys_must_be_ones_herdr_accepts(self):
+        # Round 3: any dict passed, and herdr then refused every agent.view.set.
+        good = [{"field": "attention"}, {"field": {"token": "rank"}, "order": "desc"}]
+        for bad in ([{}], [{"field": "nope"}], [{"field": "seen", "order": "up"}], [{"field": {"token": 1}}],
+                    [{"field": {"token": "a", "extra": 1}}], [{"field": ["seen"]}], ["seen"]):
+            with self.subTest(bad=bad):
+                self.write(snooze.json.dumps({"sort": bad, "views": {"plugin:x": {"l": bad}}}))
+                config = snooze.load_config()
+                self.assertIsNone(config["sort"])
+                self.assertIsNone(config["views"])
+        self.write(snooze.json.dumps({"sort": good, "views": {"plugin:x": {"l": good}}}))
+        self.assertEqual(snooze.load_config()["sort"], good)
+        for view in snooze.KNOWN_VIEWS.values():  # and ours pass our own check
+            self.assertTrue(all(snooze._sort_ok(s) for s in view["sorts"].values()))
 
     def test_malformed_json_says_so(self):
         self.write("{nope")
