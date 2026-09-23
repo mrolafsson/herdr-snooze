@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import uuid
 from datetime import datetime, timedelta
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID") or "herdr-snooze"
@@ -109,20 +110,52 @@ def socket_path():
     return os.environ.get("HERDR_SOCKET_PATH") or default_socket()
 
 
-def session_identity():
-    """What makes this herdr session this one: its socket, and the identity of
-    the directory the socket lives in. A server restart keeps both (snoozes are
-    meant to survive it); deleting a named session and creating one with the
-    same name makes a new directory, so the new session is a different one —
-    and herdr numbers its panes from w1:p1 again, so an old record must never
-    be read as its own."""
-    sock = os.path.realpath(socket_path())
+# A random ID snooze keeps in the herdr session's own directory (where its
+# socket lives), naming this incarnation of the session.
+SESSION_ID_FILE = ".herdr-snooze-session"
+
+
+def read_session_id(home):
     try:
-        home = os.stat(os.path.dirname(sock))
-        born = [home.st_ino, int(getattr(home, "st_birthtime", 0))]
+        with open(os.path.join(home, SESSION_ID_FILE), encoding="utf-8") as handle:
+            return handle.read().strip() or None
     except OSError:
-        born = None
-    return {"socket": sock, "born": born}
+        return None
+
+
+def session_id(home):
+    """The ID of the herdr session whose directory is `home`, created on first
+    use. A server restart keeps the directory and so the ID (snoozes are meant
+    to survive it). Deleting a named session removes its directory, and with
+    it the ID: a new session of the same name — whose panes herdr numbers from
+    w1:p1 again — gets a new one, so it never reads the old one's records.
+    None if the directory can't be written (then only the socket identifies
+    the session)."""
+    existing = read_session_id(home)
+    if existing:
+        return existing
+    tmp = os.path.join(home, "%s.%d.tmp" % (SESSION_ID_FILE, os.getpid()))
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(uuid.uuid4().hex + "\n")
+        try:
+            # link, not rename: it fails if another process got there first,
+            # and nobody ever reads a half-written file.
+            os.link(tmp, os.path.join(home, SESSION_ID_FILE))
+        except FileExistsError:
+            pass
+    except OSError:
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+    return read_session_id(home)
+
+
+def session_identity(sock=None):
+    """What makes this herdr session this one: its socket and its session ID."""
+    sock = os.path.realpath(sock or socket_path())
+    return {"socket": sock, "id": session_id(os.path.dirname(sock))}
 
 
 def session_key(identity=None):
@@ -348,6 +381,9 @@ def empty_state():
 # the next sync then asks herdr and clears it if it's ours.
 RECOVER = {"applied": "recover"}
 
+# What each field of the view record may hold (plan_view reads them all).
+VIEW_FIELDS = {"applied": str, "inherited": (dict, type(None)), "showing": str, "from_pane": (str, type(None))}
+
 
 def read_state():
     """The state file, or an empty state if there is none. A file that is
@@ -381,9 +417,11 @@ def read_state():
                 }
                 damaged = damaged or len(state[key]) != len(data[key])
         if isinstance(data.get("view"), dict):
-            state["view"] = dict(data["view"])
-            if "inherited" in state["view"] and not isinstance(state["view"]["inherited"], dict):
-                state["view"]["inherited"] = None
+            view = dict(data["view"])
+            if all(isinstance(view[k], types) for k, types in VIEW_FIELDS.items() if k in view):
+                state["view"] = view
+            else:
+                damaged = True  # its fields would crash planning: recover instead
         if isinstance(data.get("timer"), int):
             state["timer"] = data["timer"]
     if damaged and not state["view"]:
@@ -401,15 +439,17 @@ def locked_state():
     read-modify-write of the state file happens under one flock."""
     root = state_dir()
     os.makedirs(root, exist_ok=True)
-    ident_path = os.path.join(root, "session.json")
-    if not os.path.exists(ident_path):
-        # Which session this directory belongs to, so prune_stale_sessions
-        # can tell when that session no longer exists.
-        with open(ident_path + ".tmp", "w", encoding="utf-8") as handle:
-            json.dump(session_identity(), handle)
-        os.replace(ident_path + ".tmp", ident_path)
     with open(os.path.join(root, "lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        ident_path = os.path.join(root, "session.json")
+        if not os.path.exists(ident_path):
+            # Which session this directory belongs to, so prune_stale_sessions
+            # can tell when that session no longer exists. Written under the
+            # lock (the pruner takes it too), under a name only we use.
+            tmp = "%s.%d.tmp" % (ident_path, os.getpid())
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(session_identity(), handle)
+            os.replace(tmp, ident_path)
         state = read_state()
         before = json.dumps(state, sort_keys=True)
         try:
@@ -450,56 +490,96 @@ def prune_stale_sessions():
         try:
             with open(os.path.join(path, "session.json"), encoding="utf-8") as handle:
                 ident = json.load(handle)
-            sock = ident["socket"]
-            home = os.stat(os.path.dirname(sock))
-            alive = ident.get("born") == [home.st_ino, int(getattr(home, "st_birthtime", 0))]
-        except FileNotFoundError:
-            alive = False  # its session directory is gone (or it never had an identity)
+            sock, recorded = ident["socket"], ident["id"]
         except (OSError, ValueError, KeyError, TypeError):
-            continue  # can't tell: leave it
-        if not alive:
-            log("removing state of a herdr session that no longer exists:", key)
-            shutil.rmtree(path, ignore_errors=True)
+            # No identity (yet — it may be mid-creation) or can't read it:
+            # unknown is never proof the session is gone.
+            continue
+        home = os.path.dirname(sock)
+        if recorded is None:
+            continue  # it couldn't write an ID: nothing to compare
+        if os.path.isdir(home) and read_session_id(home) == recorded:
+            continue  # alive (running or just stopped)
+        # Its directory is gone, or holds another incarnation's ID. Take its
+        # lock, so nothing is mid-write; if it's busy, it isn't stale.
+        try:
+            with open(os.path.join(path, "lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                log("removing state of a herdr session that no longer exists:", key)
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
 
 
 # 0.1.0 kept one state file for every session, at the top of the plugin's
 # state directory. Its records may belong to any session, so none adopts them.
-LEGACY_GRACE_S = 25 * 3600  # herdr's longest token TTL (24h), and some margin
+
+
+def running_sessions():
+    """The sockets of every running herdr session, or None if herdr can't
+    say (then nothing may be assumed about the others)."""
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    try:
+        out = subprocess.run([herdr, "session", "list", "--json"], capture_output=True, text=True, timeout=5, check=True)
+        sessions = json.loads(out.stdout).get("sessions", [])
+        return [s["socket_path"] for s in sessions if s.get("running") and s.get("socket_path")]
+    except (OSError, ValueError, AttributeError, KeyError, TypeError, subprocess.SubprocessError):
+        return None
+
+
+@contextlib.contextmanager
+def in_session(sock):
+    """Act as the herdr session behind `sock`: its state, its socket."""
+    old = os.environ.get("HERDR_SOCKET_PATH")
+    os.environ["HERDR_SOCKET_PATH"] = sock
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("HERDR_SOCKET_PATH", None)
+        else:
+            os.environ["HERDR_SOCKET_PATH"] = old
 
 
 def recover_legacy(config):
-    """Once per session after upgrading from 0.1.0: fail open. If this
-    session's own state is idle, anything of ours still in it (a view, a token
-    with no record) came from 0.1.0 — clear it, so agents reappear rather than
-    stay hidden by a record no session will read again. The old file goes once
-    every token it could stand for has expired (LEGACY_GRACE_S), so a session
-    that isn't running in that window has nothing left to recover (its view
-    died with its server)."""
-    root = plugin_state_dir()
-    legacy = os.path.join(root, "snoozed.json")
+    """After upgrading from 0.1.0: fail open in every running session. For
+    each one whose own state is idle, anything of ours still in it (our view,
+    a token with no record) came from 0.1.0 — clear it, so agents reappear
+    rather than stay hidden by a record no session will read again. Done
+    through each session's own socket, by whichever session ticks first, so a
+    quiet session isn't left out. A session that isn't running needs nothing:
+    its view and tokens died with its server.
+
+    The old file goes only once every running session has recovered; until
+    then (herdr unreachable, a session refusing), it stays and the next hook
+    tries again."""
+    legacy = os.path.join(plugin_state_dir(), "snoozed.json")
     if not os.path.exists(legacy):
         return
-    since_path = os.path.join(root, "legacy-since")
-    try:
-        with open(since_path, encoding="utf-8") as handle:
-            since = float(handle.read().strip())
-    except (OSError, ValueError):
-        since = time.time()
-        with contextlib.suppress(OSError), open(since_path, "w", encoding="utf-8") as handle:
-            handle.write("%d\n" % since)
-    marker = os.path.join(state_dir(), "legacy-recovered")
-    if not os.path.exists(marker):
-        with locked_state() as state:
-            if is_idle(state):
-                state["view"] = dict(RECOVER)
-            sync(state, config)
-        with open(marker, "w", encoding="utf-8") as handle:
-            handle.write("0.1.0 state recovered\n")
-        log("recovered after upgrading from 0.1.0: cleared this session's leftover view and tokens")
-    if time.time() - since > LEGACY_GRACE_S:
-        for path in (legacy, since_path):
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(path)
+    socks = running_sessions()
+    complete = socks is not None
+    socks = list(socks or [])
+    if os.path.realpath(socket_path()) not in [os.path.realpath(s) for s in socks]:
+        socks.append(socket_path())
+    for sock in socks:
+        with in_session(sock):
+            marker = os.path.join(state_dir(), "legacy-recovered")
+            if os.path.exists(marker):
+                continue
+            try:
+                with locked_state() as state:
+                    if is_idle(state):
+                        state["view"] = dict(RECOVER)
+                    sync(state, config)
+                with open(marker, "w", encoding="utf-8") as handle:
+                    handle.write("0.1.0 state recovered\n")
+                log("recovered from 0.1.0 in", sock)
+            except (OSError, ValueError, HerdrError) as problem:
+                log("0.1.0 recovery not done yet in", sock, "-", problem)
+                complete = False
+    if complete:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(legacy)
 
 
 # ── reconcile (pure) ─────────────────────────────────────────────────────────
@@ -572,12 +652,22 @@ def reconcile(state, panes, now, force=False, badge=DEFAULT_BADGE):
             ops.append(_token_op("report", pid, entry, now, badge))
 
     # A token with no record behind it (state file lost, a run that died
-    # halfway) is an agent hidden for up to a day that no list shows.
+    # halfway) is an agent hidden for up to a day that no list shows. Token
+    # names aren't owned in herdr, so only a value we'd have written (it starts
+    # with our badge) is taken for ours; another plugin's `snoozed` stays.
     cleared = {op[1] for op in ops if op[0] == "clear"}
     for pid, pane in live.items():
-        if pid not in state["panes"] and pid not in cleared and TOKEN in (pane.get("tokens") or {}):
+        value = (pane.get("tokens") or {}).get(TOKEN)
+        if pid not in state["panes"] and pid not in cleared and value is not None and looks_ours(value, badge):
             ops.append(("clear", pid))
     return ops
+
+
+def looks_ours(value, badge):
+    """Whether a `snoozed` token's value is one snooze wrote: _token_op always
+    starts it with the badge. With no badge configured there's nothing to tell
+    by, so it's taken for ours."""
+    return not badge or str(value).startswith(badge)
 
 
 def known_sort(owner, views=None):
@@ -640,7 +730,7 @@ def plan_view(state, owner, count, sort_override=None, badge=DEFAULT_BADGE, owne
         # arriving while another plugin happens to hold the view.)
         try:
             had_list_up = json.loads(view.get("applied") or "{}").get("filter") == SNOOZED_LIST_FILTER
-        except ValueError:
+        except (ValueError, TypeError, AttributeError):
             had_list_up = False
         if had_list_up:
             view.pop("showing", None)

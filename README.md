@@ -305,17 +305,23 @@ needs doing. It sleeps, ticks once and is gone; it is not a daemon.
 
 Each herdr session has its own state, in `sessions/<key>/` under the plugin's
 state directory, since pane IDs only mean something inside one session. The key
-comes from the session's socket and its directory, so deleting a named session
-and creating a new one with the same name (whose panes herdr numbers from
-`w1:p1` again) never picks up the old one's snoozes. State left by a session
-that no longer exists is removed.
+comes from the session's socket and a random ID snooze keeps in the session's
+own directory (`.herdr-snooze-session`). A restart keeps that directory and so
+its snoozes; deleting a named session removes it, so a new session with the
+same name (whose panes herdr numbers from `w1:p1` again) never picks up the old
+one's snoozes. State left by a session that no longer exists is removed.
 
 **Upgrading from 0.1.0**, which kept one file for every session: no session
-can know whose records those were, so none adopts them. Instead each session,
-the first time it runs 0.1.1, un-hides anything 0.1.0 may have left hidden in
-it. Agents snoozed under 0.1.0 therefore come back once on upgrade; snooze them
-again. The old file is removed a day later, once every token it could stand
-for has expired.
+can know whose records those were, so none adopts them. Instead the first
+session to run 0.1.1 un-hides, in every running herdr session, anything 0.1.0
+may have left hidden there, through each session's own socket. Agents snoozed
+under 0.1.0 therefore come back once on upgrade; snooze them again. The old
+file is removed once every running session has been cleaned up.
+
+Token names aren't owned in herdr, so snooze only ever clears a `snoozed` token
+whose value it could have written (it starts with snooze's badge); another
+plugin's token of the same name is left alone. With an empty `badge` in
+config.json there's nothing to tell them apart by.
 
 The state file exists only while something is snoozed, and every command goes
 through `run.sh`, which exits before starting Python when a hook finds no file

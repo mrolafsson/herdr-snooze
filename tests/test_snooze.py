@@ -141,8 +141,13 @@ class Reconcile(unittest.TestCase):
     def test_token_without_a_record_is_cleared(self):
         # state file lost, or a run that died after tokens were sent
         st = state({"p1": {"until": self.now + HOUR, "token_until": self.now + HOUR}})
-        live = [pane("p1", tokens={"snoozed": "z"}), pane("ghost", tokens={"snoozed": "z"}), pane("plain")]
-        self.assertEqual(snooze.reconcile(st, live, self.now), [("clear", "ghost")])
+        live = [pane("p1", tokens={"snoozed": "z 12:00"}), pane("ghost", tokens={"snoozed": "z 12:00"}), pane("plain")]
+        self.assertEqual(snooze.reconcile(st, live, self.now, badge="z"), [("clear", "ghost")])
+
+    def test_another_plugins_token_of_the_same_name_is_left_alone(self):
+        # token names aren't owned in herdr: only a value we'd write is ours
+        live = [pane("theirs", tokens={"snoozed": "yes"}), pane("ours", tokens={"snoozed": "z 12:00"})]
+        self.assertEqual(snooze.reconcile(state(), live, self.now, badge="z"), [("clear", "ours")])
 
     def test_expiry_clear_is_not_sent_twice(self):
         st = state({"p1": {"until": self.now - 1}})
@@ -607,7 +612,14 @@ class Commands(unittest.TestCase):
         self.panes = [dict(pane("work"), focused=True), dict(pane("zz"), focused=False)]
         self.herdr = FakeHerdr(self.panes, {"active": True, "source": RADAR, "label": "active"})
         self.notify = mock.Mock()
-        for patcher in (mock.patch.dict(os.environ, {"SNOOZE_STATE_DIR": self.dir.name, "HERDR_PLUGIN_CONTEXT_JSON": ""}),
+        # A herdr session directory of our own, so the session ID file never
+        # lands in the real ~/.config/herdr.
+        home = os.path.join(self.dir.name, "herdr-a")
+        os.makedirs(home)
+        sock = os.path.join(home, "herdr.sock")
+        env = {"SNOOZE_STATE_DIR": self.dir.name, "HERDR_PLUGIN_CONTEXT_JSON": "", "HERDR_SOCKET_PATH": sock}
+        for patcher in (mock.patch.dict(os.environ, env),
+                        mock.patch.object(snooze, "running_sessions", return_value=[sock]),
                         mock.patch.object(snooze, "call", self.herdr), mock.patch.object(snooze, "_spawn_timer"),
                         mock.patch.object(snooze, "owner_turned_off", return_value=False),
                         mock.patch.object(snooze, "notify", self.notify), mock.patch.object(snooze, "log"),
@@ -707,30 +719,64 @@ class Commands(unittest.TestCase):
             handle.write('{"panes": {"zz": {"until": %d, "via": "pane"}}, "workspaces": {}, "view": {}}' % (snooze.now_ms() + HOUR))
         return path
 
-    def test_0_1_0_state_is_adopted_by_no_session_and_fails_open(self):
+    def second_session(self, reachable=True):
+        """A second running herdr session with its own herdr: quiet (it never
+        ticks here), still showing 0.1.0's snoozed-only view, with a 0.1.0
+        token on its own w1-numbered pane."""
+        home = os.path.join(self.dir.name, "herdr-b")
+        os.makedirs(home, exist_ok=True)
+        sock = os.path.join(home, "herdr.sock")
+        self.herdr_b = FakeHerdr([dict(pane("zz", tokens={snooze.TOKEN: "z 12:00"}), focused=False)],
+                                 {"active": True, "source": snooze.SOURCE, "label": "z snoozed only · 1"})
+        self.b_reachable = reachable
+        mine = snooze.socket_path()
+
+        def route(method, params=None, timeout=5.0):
+            if os.path.realpath(snooze.socket_path()) == os.path.realpath(sock):
+                if not self.b_reachable:
+                    raise OSError("session b not answering")
+                return self.herdr_b(method, params, timeout)
+            return self.herdr(method, params, timeout)
+
+        for patcher in (mock.patch.object(snooze, "call", route),
+                        mock.patch.object(snooze, "running_sessions", return_value=[mine, sock])):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return sock
+
+    def test_0_1_0_state_is_adopted_by_no_session_and_fails_open_everywhere(self):
         legacy = self.legacy()
+        self.second_session()
         self.panes[1]["tokens"][snooze.TOKEN] = "z 12:00"  # 0.1.0's token, maybe this session's
         self.herdr.view = {"active": True, "source": snooze.SOURCE, "label": "z 1"}
         self.assertEqual(snooze.main(["tick"]), 0)
-        self.assertNotIn(snooze.TOKEN, self.panes[1]["tokens"])  # the agent reappears
+        # this session: the agent reappears, and "zz" wasn't adopted as ours
+        self.assertNotIn(snooze.TOKEN, self.panes[1]["tokens"])
         self.assertEqual(self.herdr.view, {"active": False})
-        self.assertEqual(snooze.read_state()["panes"], {})  # "zz" wasn't adopted as ours
-        self.assertTrue(os.path.exists(legacy))  # other sessions still need to see it
+        self.assertEqual(snooze.read_state()["panes"], {})
+        # the quiet session, which never ticked, recovered through its own socket
+        self.assertEqual(self.herdr_b.view, {"active": False})
+        self.assertNotIn(snooze.TOKEN, self.herdr_b.panes[0]["tokens"])
+        # everyone recovered: the old file goes, and run.sh stops starting Python
+        self.assertFalse(os.path.exists(legacy))
 
-    def test_each_session_recovers_once(self):
-        self.legacy()
-        snooze.main(["tick"])
-        self.herdr.calls.clear()
-        self.assertEqual(snooze.main(["tick"]), 0)
-        self.assertEqual(self.herdr.calls, [], "recovered again on every hook")
-
-    def test_0_1_0_file_goes_once_every_token_it_stood_for_has_expired(self):
+    def test_0_1_0_file_stays_until_every_running_session_recovered(self):
         legacy = self.legacy()
-        snooze.main(["tick"])
-        with open(os.path.join(self.dir.name, "legacy-since"), "w") as handle:
-            handle.write("%d\n" % (snooze.time.time() - snooze.LEGACY_GRACE_S - 60))
-        snooze.main(["tick"])
-        self.assertFalse(os.path.exists(legacy), "left behind, it keeps every hook starting Python")
+        self.second_session(reachable=False)
+        self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertTrue(os.path.exists(legacy), "removed with a session still unrecovered")
+        self.herdr.calls.clear()
+        self.b_reachable = True
+        self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertEqual(self.herdr_b.view, {"active": False})
+        self.assertFalse(os.path.exists(legacy))
+        self.assertNotIn("agent.view.clear", self.herdr.calls, "recovered this session again")
+
+    def test_0_1_0_file_stays_if_herdr_cant_list_sessions(self):
+        legacy = self.legacy()
+        with mock.patch.object(snooze, "running_sessions", return_value=None):
+            self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertTrue(os.path.exists(legacy))  # no proof the others recovered
 
     def test_a_session_with_its_own_snoozes_keeps_them_through_recovery(self):
         self.snoozed(snooze.now_ms() + HOUR)
@@ -839,6 +885,50 @@ class Sessions(unittest.TestCase):
         with self.in_session(work):
             self.assertIn("w1:p1", snooze.read_state()["panes"])
 
+    def test_identity_doesnt_depend_on_the_file_system(self):
+        # Round 2b: inode + birth time could repeat on Linux after a delete.
+        # The session ID is random and lives in the session's own directory.
+        work = self.session("work")
+        with self.in_session(work):
+            first = snooze.session_identity()
+            self.assertEqual(snooze.session_identity(), first)  # stable while the directory lives
+        home = os.path.dirname(work)
+        os.remove(os.path.join(home, snooze.SESSION_ID_FILE))  # what deleting the session does to it
+        with self.in_session(work):
+            self.assertNotEqual(snooze.session_identity()["id"], first["id"])
+
+    def test_a_session_being_set_up_is_never_pruned(self):
+        # Round 2b: its directory exists before its identity is written.
+        work, play = self.session("work"), self.session("play")
+        with self.in_session(work):
+            half = snooze.state_dir()
+        os.makedirs(half)  # created, identity not written yet
+        with self.in_session(play):
+            snooze.prune_stale_sessions()
+        self.assertTrue(os.path.isdir(half))
+
+    def test_a_busy_stale_session_is_left_for_later(self):
+        work, play = self.session("work"), self.session("play")
+        self.snooze_in(work)
+        with self.in_session(work):
+            stale = snooze.state_dir()
+        shutil.rmtree(os.path.dirname(work))
+        with open(os.path.join(stale, "lock"), "a") as lock:
+            snooze.fcntl.flock(lock, snooze.fcntl.LOCK_EX)  # something is writing it
+            with self.in_session(play):
+                snooze.prune_stale_sessions()
+            self.assertTrue(os.path.isdir(stale))
+        with self.in_session(play):
+            snooze.prune_stale_sessions()
+        self.assertFalse(os.path.exists(stale))
+
+    def test_two_first_runs_agree_on_one_id(self):
+        import multiprocessing
+        home = os.path.dirname(self.session("race"))
+        with multiprocessing.Pool(4) as pool:
+            ids = pool.map(snooze.session_id, [home] * 8)
+        self.assertEqual(len(set(ids)), 1, ids)
+
 
 class RunSh(unittest.TestCase):
     """run.sh's fast path must find state wherever snooze.py puts it, or every
@@ -885,11 +975,25 @@ class StateFile(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        patcher = mock.patch.dict(os.environ, {"SNOOZE_STATE_DIR": self.dir.name})
+        home = os.path.join(self.dir.name, "herdr-a")
+        os.makedirs(home)
+        env = {"SNOOZE_STATE_DIR": self.dir.name, "HERDR_SOCKET_PATH": os.path.join(home, "herdr.sock")}
+        patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
         os.makedirs(snooze.state_dir(), exist_ok=True)
         self.path = os.path.join(snooze.state_dir(), "snoozed.json")
+
+    def test_nested_view_fields_of_the_wrong_type_are_damage(self):
+        # Round 2b: {"applied": 7} made planning crash on every hook.
+        for view in ({"applied": 7}, {"inherited": "radar"}, {"showing": 1}, {"from_pane": []}):
+            with self.subTest(view=view):
+                with open(self.path, "w") as handle:
+                    handle.write(snooze.json.dumps({"panes": {}, "workspaces": {}, "view": view}))
+                self.assertEqual(snooze.read_state()["view"], snooze.RECOVER)
+        owner = {"active": True, "source": RADAR, "label": "active"}
+        st = state(view={"applied": 7})  # even if one got through, planning must not crash
+        snooze.plan_view(st, owner, 0)
 
     def test_saved_even_when_the_body_fails(self):
         # tokens may already be on panes when a later herdr call dies
