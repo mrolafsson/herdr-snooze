@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 import shutil
@@ -432,24 +433,55 @@ class SettleShowing(unittest.TestCase):
 class ArmTimer(unittest.TestCase):
     now = snooze.to_ms(NOON)
 
-    def arm(self, st):
+    SAFETY_S = snooze.SAFETY_MS // 1000
+
+    def setUp(self):
+        # A pretend process table: a sleeper is "alive" until we say it died.
+        self.alive, self.stopped, self.next_pid = set(), [], [1000]
+        for patcher in (mock.patch.object(snooze, "timer_alive", lambda pid: pid in self.alive),
+                        mock.patch.object(snooze, "stop_timer", lambda pid: self.stopped.append(pid))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def arm(self, st, now=None):
         delays = []
-        snooze.arm_timer(st, self.now, spawn=delays.append)
+
+        def spawn(delay):
+            delays.append(delay)
+            self.next_pid[0] += 1
+            self.alive.add(self.next_pid[0])
+            return self.next_pid[0]
+
+        snooze.arm_timer(st, self.now if now is None else now, spawn=spawn)
         return delays
 
     def test_arms_once_for_the_soonest_deadline(self):
         st = state({"a": {"until": self.now + 90_000}, "b": {"until": self.now + HOUR}})
         self.assertEqual(self.arm(st), [91])  # just after, never before
         self.assertEqual(st["timer"], self.now + 90_000)
-        self.assertEqual(self.arm(st), [])  # already armed for it
+        self.assertEqual(self.arm(st), [])  # already armed for it, and the sleeper is alive
 
-    def test_rearms_when_an_earlier_deadline_appears_or_the_soonest_is_woken(self):
-        st = state({"a": {"until": self.now + HOUR}})
+    def test_rearms_when_an_earlier_deadline_appears(self):
+        st = state({"a": {"until": self.now + 2 * 60_000}})
         self.arm(st)
+        first = st["timer_pid"]
         st["panes"]["b"] = {"until": self.now + 60_000}
         self.assertEqual(self.arm(st), [61])
-        del st["panes"]["b"]
-        self.assertEqual(self.arm(st), [3601])
+        self.assertIn(first, self.stopped, "the replaced sleeper was left running")
+
+    def test_never_sleeps_longer_than_the_safety_interval(self):
+        # v0.2: herdr has no event for another plugin taking the view; a tick
+        # at least every few minutes is how snooze notices.
+        st = state({"a": {"until": self.now + HOUR}})
+        self.assertEqual(self.arm(st), [self.SAFETY_S + 1])
+
+    def test_a_dead_sleeper_is_replaced(self):
+        # v0.2: 0.1 trusted a recorded sleeper even after it died, and a long
+        # snooze then woke at the 24h TTL instead of its deadline.
+        st = state({"a": {"until": self.now + 60_000}})
+        self.arm(st)
+        self.alive.clear()  # killed, or the machine slept through it
+        self.assertEqual(self.arm(st), [61])
 
     def test_workspaces_count(self):
         st = state(workspaces={"w": {"until": self.now + 30_000}})
@@ -462,19 +494,49 @@ class ArmTimer(unittest.TestCase):
         week = self.now + 7 * 24 * HOUR
         st = state({"a": {"until": week, "dirty": True}})
         snooze.reconcile(st, [pane("a")], self.now)
-        self.assertEqual(self.arm(st), [12 * 3600 + 2])  # as the token enters its refresh margin
-
-        later = self.now + 12 * HOUR + 2000
-        ops = snooze.reconcile(st, [pane("a", tokens=live_token())], later)
-        self.assertEqual([op[0] for op in ops], ["report"])  # that wake-up does refresh it
-        delays = []
-        snooze.arm_timer(st, later, spawn=delays.append)
-        self.assertEqual(delays, [12 * 3600 + 2])  # and books the next one
+        self.arm(st)
+        # Safety ticks come every few minutes; follow them to the refresh margin.
+        now = self.now
+        while now < self.now + 12 * HOUR + 2000:
+            now = st["timer"]
+            ops = snooze.reconcile(st, [pane("a", tokens=live_token())], now)
+            if ops:
+                break
+            self.arm(st, now)
+        self.assertEqual([op[0] for op in ops], ["report"])  # the token is refreshed in time
+        self.assertLessEqual(now, self.now + 12 * HOUR + 2000)
 
     def test_short_snooze_is_not_woken_for_a_refresh_it_does_not_need(self):
-        st = state({"a": {"until": self.now + HOUR, "dirty": True}})
+        st = state({"a": {"until": self.now + 60_000, "dirty": True}})
         snooze.reconcile(st, [pane("a")], self.now)
-        self.assertEqual(self.arm(st), [3601])
+        self.assertEqual(self.arm(st), [61])
+
+    def test_real_sleepers_are_recognised_and_only_ours_are_stopped(self):
+        import subprocess
+        mock.patch.stopall()  # the real helpers, against real processes
+        try:
+            subprocess.run(["ps", "-o", "command=", "-p", str(os.getpid())], capture_output=True, check=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("ps isn't available here (a sandbox)")
+        # The same shape as _spawn_timer's command: a compound one keeps the
+        # shell (and its $0 name) alive; `sh -c "sleep 30"` alone would exec
+        # sleep in its place and lose the name.
+        ours = subprocess.Popen([snooze.TIMER_SHELL, "-c", "sleep 30 && true", snooze.TIMER_NAME], start_new_session=True)
+        other = subprocess.Popen(["/bin/sh", "-c", "sleep 30 && true", "not-snooze"], start_new_session=True)
+        try:
+            self.assertTrue(snooze.timer_alive(ours.pid))
+            self.assertTrue(snooze.is_our_timer(ours.pid))
+            self.assertFalse(snooze.is_our_timer(other.pid))
+            snooze.stop_timer(other.pid)  # a reused PID: must survive
+            snooze.stop_timer(ours.pid)
+            self.assertIsNotNone(ours.wait(timeout=5))
+            self.assertIsNone(other.poll(), "stopped someone else's process")
+            self.assertFalse(snooze.timer_alive(ours.pid))
+        finally:
+            for p in (ours, other):
+                with contextlib.suppress(OSError):
+                    p.kill()
+                p.wait()
 
     def test_nothing_snoozed_disarms(self):
         st = state()
@@ -662,10 +724,12 @@ class SyncAgainstFakeHerdr(unittest.TestCase):
         self.assertEqual(self.state["view"]["inherited"]["source"], "herdr-agent-inbox")
 
     def test_timer_armed_for_the_soonest_deadline(self):
-        self.sync()
-        snooze._spawn_timer.assert_called_once()
-        self.sync()
-        snooze._spawn_timer.assert_called_once()  # not again for the same deadline
+        snooze._spawn_timer.return_value = 4242
+        with mock.patch.object(snooze, "timer_alive", lambda pid: pid == 4242):
+            self.sync()
+            snooze._spawn_timer.assert_called_once()
+            self.sync()
+            snooze._spawn_timer.assert_called_once()  # not again while that sleeper lives
 
 
 class Commands(unittest.TestCase):
@@ -989,6 +1053,44 @@ class Commands(unittest.TestCase):
         self.assertFalse(os.path.exists(self.file))
 
 
+class Config(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        patcher = mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONFIG_DIR": self.dir.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.log = mock.patch.object(snooze, "log").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def write(self, text):
+        with open(os.path.join(self.dir.name, "config.json"), "w") as handle:
+            handle.write(text)
+
+    def test_wrong_types_fall_back_to_defaults_with_a_note(self):
+        # v0.2: "badge": 7 crashed every hook; a list in "views" too.
+        self.write('{"badge": 7, "views": ["x"], "sort": {"a": 1}, "notify": "yes", "durations": [], "auto_return": false}')
+        config = snooze.load_config()
+        self.assertEqual(config["badge"], snooze.DEFAULT_BADGE)
+        self.assertIsNone(config["views"])
+        self.assertIsNone(config["sort"])
+        self.assertFalse(config["notify"])
+        self.assertEqual(config["durations"], snooze.DEFAULT_DURATIONS)
+        self.assertFalse(config["auto_return"])  # the valid one is kept
+        self.assertGreaterEqual(self.log.call_count, 5)
+
+    def test_malformed_json_says_so(self):
+        self.write("{nope")
+        self.assertEqual(snooze.load_config()["badge"], snooze.DEFAULT_BADGE)
+        self.assertTrue(self.log.called, "settings silently ignored")
+
+    def test_valid_settings_are_kept(self):
+        self.write('{"badge": "zz", "durations": ["5m", 30], "views": {"src": {"label": [{"field": "status", "order": "asc"}]}}}')
+        config = snooze.load_config()
+        self.assertEqual((config["badge"], config["durations"]), ("zz", ["5m", 30]))
+        self.assertIn("src", config["views"])
+
+
 class Sessions(unittest.TestCase):
     """Pane IDs only mean something inside one herdr session; the plugin's
     state directory is shared by all of them."""
@@ -1100,10 +1202,26 @@ class Sessions(unittest.TestCase):
 
     def test_two_first_runs_agree_on_one_id(self):
         import multiprocessing
-        home = os.path.dirname(self.session("race"))
+        sock = self.session("race")
         with multiprocessing.Pool(4) as pool:
-            ids = pool.map(snooze.session_id, [home] * 8)
+            ids = pool.map(snooze.session_id, [sock] * 8)
         self.assertEqual(len(set(ids)), 1, ids)
+
+    def test_herdrs_own_sessions_keep_the_0_1_1_id_file(self):
+        # Renaming it would re-key every 0.1.1 session and orphan its state.
+        sock = self.session("work")
+        self.assertEqual(snooze.session_id_path(sock), os.path.join(os.path.dirname(sock), snooze.SESSION_ID_FILE))
+
+    def test_custom_sockets_sharing_a_directory_dont_share_an_identity(self):
+        # v0.2 (r2c): several custom sockets in /tmp shared one ID file.
+        shared = os.path.join(self.dir.name, "tmp")
+        os.makedirs(shared)
+        a, b = os.path.join(shared, "a.sock"), os.path.join(shared, "b.sock")
+        self.assertNotEqual(snooze.session_id(a), snooze.session_id(b))
+        os.remove(snooze.session_id_path(a))  # a's server is gone; b's identity must stand
+        with self.in_session(b):
+            b_key = snooze.session_key()
+        self.assertEqual(snooze.session_key({"socket": os.path.realpath(b), "id": snooze.read_session_id(b)}), b_key)
 
 
 class RunSh(unittest.TestCase):
@@ -1145,6 +1263,36 @@ class RunSh(unittest.TestCase):
         os.makedirs(session)
         open(os.path.join(session, "snoozed.json"), "w").close()
         self.assertTrue(self.tick())
+
+    def run_with_stand_in_python3(self):
+        """Runs `run.sh list` with a stand-in python3 on PATH, whose
+        interpreter records that it ran. Returns which one was used."""
+        import subprocess
+        bin_dir = os.path.join(self.dir.name, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        fresh_marker = os.path.join(self.dir.name, "fresh")
+        fresh = os.path.join(bin_dir, "freshpy")
+        with open(fresh, "w") as handle:
+            handle.write('#!/bin/sh\ntouch "%s"\n' % fresh_marker)
+        os.chmod(fresh, 0o755)
+        with open(os.path.join(bin_dir, "python3"), "w") as handle:
+            handle.write('#!/bin/sh\necho "%s"\n' % fresh)  # what `python3 -c ...sys.executable` prints
+        os.chmod(os.path.join(bin_dir, "python3"), 0o755)
+        env = dict(os.environ, SNOOZE_STATE_DIR=self.dir.name, PATH=bin_dir + ":/usr/bin:/bin")
+        subprocess.run(["/bin/sh", self.run_sh, "list"], env=env, check=True)
+        return "cache" if os.path.exists(self.marker) else "fresh" if os.path.exists(fresh_marker) else None
+
+    def test_a_private_interpreter_cache_is_used(self):
+        self.assertEqual(self.run_with_stand_in_python3(), "cache")
+
+    def test_an_interpreter_cache_others_could_write_is_ignored(self):
+        # v0.2: the cache names the program run.sh executes.
+        os.chmod(os.path.join(self.dir.name, "python"), 0o666)
+        self.assertEqual(self.run_with_stand_in_python3(), "fresh")
+
+    def test_a_cache_in_a_directory_others_could_write_is_ignored(self):
+        os.chmod(self.dir.name, 0o777)
+        self.assertEqual(self.run_with_stand_in_python3(), "fresh")
 
 
 class StateFile(unittest.TestCase):

@@ -174,6 +174,22 @@ deadline.
 **It survives restarts and long waits.** Snoozes are restored after a herdr
 restart, and a week-long snooze stays hidden for the week. If the machine sleeps
 through a deadline, the agent reappears at your first focus change after waking.
+Durations are real elapsed time: `2h` is two hours even across a daylight-saving
+change, while a clock time like `9am` stays 9am.
+
+**A snooze belongs to the agent you snoozed.** If that agent exits and another
+starts in the same pane, the new one isn't hidden. Moving a pane to another
+space keeps its snooze. If the picker was left open while its pane moved,
+closed or got a new agent, it says so instead of snoozing the wrong thing.
+(With an agent that doesn't report a session to herdr, a new agent of the same
+kind in the same pane can't be told apart from the old one.)
+
+**Sharing the Agents panel.** herdr has one agent view, and the last plugin to
+set it wins. While something is snoozed, snooze keeps its view in place,
+checking at least every five minutes, since herdr gives plugins no event when
+another one takes it over. A plugin you switch to directly can therefore lose
+the panel to snooze within a few minutes; see
+[Alongside plugins that sort the Agents panel](#alongside-plugins-that-sort-the-agents-panel).
 
 **The 💤 is not a button.** herdr offers plugins no hook for clicking the panel
 label, and its right-click menus are built-in only (as of 0.9.1), so everything
@@ -205,7 +221,9 @@ herdr plugin config-dir herdr-snooze
 | `views` | — | Teach snooze another plugin's panel order. See below. |
 | `sort` | — | Always use this `agent.view.set` sort while something is snoozed. |
 
-Changes apply to the next action; no reload needed. See
+Changes apply to the next action; no reload needed. A value of the wrong type
+falls back to its default, with a note in `herdr plugin log list --plugin
+herdr-snooze`, rather than breaking snooze. See
 [`config.example.json`](config.example.json).
 
 ### Alongside plugins that sort the Agents panel
@@ -247,10 +265,12 @@ Then, by hand:
 - Remove the `[[keys.command]]` blocks that reference `herdr-snooze.*` from
   `config.toml`, and `"$snoozed"` from `ui.sidebar.spaces.rows` if you added it,
   then `herdr server reload-config`.
-- herdr leaves the plugin's config and state directories behind:
+- herdr leaves the plugin's config and state directories behind, and snooze's
+  small session-ID file next to each herdr session's socket:
 
   ```bash
   rm -r ~/.config/herdr/plugins/config/herdr-snooze ~/.local/state/herdr/plugins/herdr-snooze
+  rm -f ~/.config/herdr/.herdr-snooze-session ~/.config/herdr/sessions/*/.herdr-snooze-session*
   ```
 
 If you uninstall while agents are still snoozed, nothing breaks: herdr drops the
@@ -292,16 +312,26 @@ python3 snooze.py list
 
 ## How it works
 
-A snoozed pane carries a `snoozed` metadata token, and the Agents panel view is
-filtered to `not(exists snoozed)`. The token is reported with a TTL, so herdr
-drops it at the deadline.
+A snoozed pane carries two metadata tokens: `snoozed`, the badge text you can
+show in the sidebar (`"$snoozed"`), and `herdr_snooze`, which only snooze
+writes. The Agents panel view is filtered to `not(exists herdr_snooze)`, so
+another plugin that happens to use a `snoozed` token can't hide or un-hide
+anything. The tokens are reported with a TTL, so herdr drops them at the
+deadline.
 
 A small state file, `snoozed.json` in the plugin's state directory, holds the
-real deadlines. `tick` — a startup hook plus a few event hooks — reconciles what
-a TTL alone cannot: herdr caps a token's TTL at 24h, tokens and the view do not
-survive a server restart, and another plugin can replace the view. Each snooze
-also arms one detached `sleep` that runs a tick at the next moment something
-needs doing. It sleeps, ticks once and is gone; it is not a daemon.
+real deadlines, and which agent each one is for. `tick` — a startup hook plus
+a few event hooks — reconciles what a TTL alone cannot: herdr caps a token's
+TTL at 24h, tokens and the view do not survive a server restart, another plugin
+can replace the view, and a pane that moves gets a new ID. Hooks fire in
+bursts, so a tick that finds another one running leaves a note and exits, and
+the running one goes once more.
+
+Between events, one detached `sleep` runs a tick at the next moment something
+needs doing, and at least every five minutes while anything is snoozed. It
+sleeps, ticks once and is gone; it is not a daemon. Its process ID is kept, so
+if it dies (killed, or the machine slept) the next event arms a new one, and
+one replaced by an earlier deadline is stopped.
 
 Each herdr session has its own state, in `sessions/<key>/` under the plugin's
 state directory, since pane IDs only mean something inside one session. The key

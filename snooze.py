@@ -116,38 +116,51 @@ def socket_path():
     return os.environ.get("HERDR_SOCKET_PATH") or default_socket()
 
 
-# A random ID snooze keeps in the herdr session's own directory (where its
-# socket lives), naming this incarnation of the session.
+# A random ID snooze keeps next to the herdr session's socket, naming this
+# incarnation of the session.
 SESSION_ID_FILE = ".herdr-snooze-session"
 
 
-def read_session_id(home):
+def session_id_path(sock):
+    """Where a socket's session ID lives. herdr's own sessions each have a
+    directory with one herdr.sock in it, and keep the 0.1.1 name. A socket
+    named anything else (a custom HERDR_SOCKET_PATH, perhaps one of several in
+    /tmp) gets a file of its own, so sockets sharing a directory don't share
+    an identity."""
+    home, name = os.path.split(sock)
+    if name == "herdr.sock":
+        return os.path.join(home, SESSION_ID_FILE)
+    return os.path.join(home, "%s-%s" % (SESSION_ID_FILE, name))
+
+
+def read_session_id(sock):
     try:
-        with open(os.path.join(home, SESSION_ID_FILE), encoding="utf-8") as handle:
+        with open(session_id_path(sock), encoding="utf-8") as handle:
             return handle.read().strip() or None
     except OSError:
         return None
 
 
-def session_id(home):
-    """The ID of the herdr session whose directory is `home`, created on first
-    use. A server restart keeps the directory and so the ID (snoozes are meant
-    to survive it). Deleting a named session removes its directory, and with
-    it the ID: a new session of the same name — whose panes herdr numbers from
+def session_id(sock):
+    """The ID of the herdr session listening on `sock`, created on first use.
+    A server restart keeps its directory and so the ID (snoozes are meant to
+    survive it). Deleting a named session removes its directory, and with it
+    the ID: a new session of the same name — whose panes herdr numbers from
     w1:p1 again — gets a new one, so it never reads the old one's records.
     None if the directory can't be written (then only the socket identifies
     the session)."""
-    existing = read_session_id(home)
+    existing = read_session_id(sock)
     if existing:
         return existing
-    tmp = os.path.join(home, "%s.%d.tmp" % (SESSION_ID_FILE, os.getpid()))
+    path = session_id_path(sock)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(uuid.uuid4().hex + "\n")
         try:
             # link, not rename: it fails if another process got there first,
             # and nobody ever reads a half-written file.
-            os.link(tmp, os.path.join(home, SESSION_ID_FILE))
+            os.link(tmp, path)
         except FileExistsError:
             pass
     except OSError:
@@ -155,13 +168,13 @@ def session_id(home):
     finally:
         with contextlib.suppress(OSError):
             os.remove(tmp)
-    return read_session_id(home)
+    return read_session_id(sock)
 
 
 def session_identity(sock=None):
     """What makes this herdr session this one: its socket and its session ID."""
     sock = os.path.realpath(sock or socket_path())
-    return {"socket": sock, "id": session_id(os.path.dirname(sock))}
+    return {"socket": sock, "id": session_id(sock)}
 
 
 def session_key(identity=None):
@@ -189,17 +202,46 @@ def config_dir():
     return os.path.join(base, "herdr", "plugins", "config", PLUGIN_ID)
 
 
+def _sort_ok(value):
+    return isinstance(value, list) and all(isinstance(s, dict) for s in value)
+
+
+# Each setting: its default, and what a valid value looks like. A wrong value
+# falls back to the default, with a note in the plugin log, instead of
+# crashing a hook halfway through a change (and every hook after it).
+CONFIG_SCHEMA = {
+    "durations": (lambda: list(DEFAULT_DURATIONS),
+                  lambda v: isinstance(v, list) and v and all(isinstance(d, (str, int)) for d in v)),
+    "badge": (lambda: DEFAULT_BADGE, lambda v: isinstance(v, str)),
+    "notify": (lambda: False, lambda v: isinstance(v, bool)),
+    "sort": (lambda: None, lambda v: v is None or _sort_ok(v)),
+    "views": (lambda: None, lambda v: v is None or (isinstance(v, dict) and all(
+        isinstance(labels, dict) and all(_sort_ok(s) for s in labels.values()) for labels in v.values()))),
+    "auto_return": (lambda: True, lambda v: isinstance(v, bool)),
+}
+
+
 def load_config():
-    config = {"durations": list(DEFAULT_DURATIONS), "badge": DEFAULT_BADGE, "notify": False, "sort": None, "views": None, "auto_return": True}
+    config = {key: default() for key, (default, _valid) in CONFIG_SCHEMA.items()}
+    path = os.path.join(config_dir(), "config.json")
     try:
-        with open(os.path.join(config_dir(), "config.json"), encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             user = json.load(handle)
-        if isinstance(user, dict):
-            config.update({k: v for k, v in user.items() if k in config})
-    except (OSError, ValueError):
-        pass
-    if not isinstance(config["durations"], list) or not config["durations"]:
-        config["durations"] = list(DEFAULT_DURATIONS)
+    except FileNotFoundError:
+        return config
+    except (OSError, ValueError) as problem:
+        log("config.json ignored, using defaults:", problem)
+        return config
+    if not isinstance(user, dict):
+        log("config.json ignored: it must be a JSON object")
+        return config
+    for key, value in user.items():
+        if key not in CONFIG_SCHEMA:
+            continue
+        if CONFIG_SCHEMA[key][1](value):
+            config[key] = value
+        else:
+            log("config.json: %r has an invalid value; using the default" % key)
     return config
 
 
@@ -383,7 +425,7 @@ def from_ms(ms):
 
 
 def empty_state():
-    return {"v": 1, "panes": {}, "workspaces": {}, "view": {}, "timer": None}
+    return {"v": 1, "panes": {}, "workspaces": {}, "view": {}, "timer": None, "timer_pid": None}
 
 
 # A view record meaning "we may hold the view, but don't know what we set":
@@ -445,6 +487,8 @@ def read_state():
                 damaged = True  # its fields would crash planning: recover instead
         if isinstance(data.get("timer"), int):
             state["timer"] = data["timer"]
+        if isinstance(data.get("timer_pid"), int):
+            state["timer_pid"] = data["timer_pid"]
     if damaged and not state["view"]:
         state["view"] = dict(RECOVER)
     return state
@@ -519,7 +563,7 @@ def prune_stale_sessions():
         home = os.path.dirname(sock)
         if recorded is None:
             continue  # it couldn't write an ID: nothing to compare
-        if os.path.isdir(home) and read_session_id(home) == recorded:
+        if os.path.isdir(home) and read_session_id(sock) == recorded:
             continue  # alive (running or just stopped)
         # Its directory is gone, or holds another incarnation's ID. Take its
         # lock, so nothing is mid-write; if it's busy, it isn't stale.
@@ -902,40 +946,81 @@ def probe_view():
 def _spawn_timer(delay_s):
     launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
     subprocess.Popen(
-        ["/bin/sh", "-c", 'sleep "$1" && exec /bin/sh "$2" tick', "snooze-timer", str(delay_s), launcher],
+        [TIMER_SHELL, "-c", 'sleep "$1" && exec /bin/sh "$2" tick', TIMER_NAME, str(delay_s), launcher],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, close_fds=True,
-    )
+    ).pid
+
+
+TIMER_SHELL = "/bin/sh"
+TIMER_NAME = "snooze-timer"  # its $0, so a sleeper can be told apart from a reused PID
+# At most this long between ticks while anything is snoozed, whatever the
+# deadlines: herdr has no event for another plugin taking the agent view, so
+# this is how snooze notices (and how a dead sleeper is noticed on a quiet
+# machine).
+SAFETY_MS = 5 * 60 * 1000
+
+
+def timer_alive(pid):
+    """Whether our sleeper is still there. A signal-0 probe: cheap, but a PID
+    can be reused, so killing it goes through is_our_timer first."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False  # someone else's process has that PID now
+
+
+def is_our_timer(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        return TIMER_NAME in out.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def stop_timer(pid):
+    if timer_alive(pid) and is_our_timer(pid):
+        with contextlib.suppress(OSError):
+            os.killpg(pid, 15)  # its own session/group: the sleep goes with it
 
 
 def arm_timer(state, now, spawn=None):
-    """One detached `sleep` that runs a tick just after the next deadline.
+    """One detached `sleep` that runs a tick at the next moment something needs
+    doing (a deadline, a token due for refresh, or SAFETY_MS at the latest).
 
     herdr's TTL already un-hides the agent on time; what nothing does on time
     is *us* noticing: the label keeps its count, the view stays borrowed, and
-    in the snoozed list the last agent expiring leaves an empty panel — until
-    some unrelated event happens to fire a hook. Not a daemon: it sleeps, ticks
-    once, and is gone."""
+    in the snoozed list the last agent expiring leaves an empty panel. And a
+    snooze longer than the TTL cap must be re-reported before its token dies.
+    Not a daemon: each sleeper ticks once and is gone. Its PID is kept, so a
+    sleeper that died (killed, a machine sleep) is replaced by the next tick
+    instead of being trusted until the snooze ends early."""
     entries = list(state["panes"].values()) + list(state["workspaces"].values())
     if not entries:
-        state["timer"] = None
+        stop_timer(state.get("timer_pid"))
+        state["timer"], state["timer_pid"] = None, None
         return
-    # A snooze longer than the 24h TTL cap has to be re-reported before its
-    # token dies, or the agent pops back days early on a machine quiet enough
-    # that no hook fires (a weekend). So the next wake-up is whichever comes
-    # first: a deadline, or a token entering its refresh margin.
     soonest = min(
         entry["until"] if entry.get("token_until", entry["until"]) >= entry["until"]
         else min(entry["until"], entry["token_until"] - REFRESH_MARGIN_MS + 1000)
         for entry in entries
     )
-    if state.get("timer") == soonest:
-        return
+    current, pid = state.get("timer"), state.get("timer_pid")
+    if isinstance(current, int) and now < current <= soonest and timer_alive(pid):
+        return  # a live sleeper will tick in time, and re-arm then
+    wake_at = min(soonest, now + SAFETY_MS)
     try:
-        (spawn or _spawn_timer)(max(1, (soonest - now) // 1000 + 1))
-        state["timer"] = soonest
+        new_pid = (spawn or _spawn_timer)(max(1, (wake_at - now) // 1000 + 1))
     except OSError as error:
         log("timer not armed:", error)  # hooks still catch up, just later
+        return
+    stop_timer(pid)  # the one it replaces, if it's still sleeping
+    state["timer"], state["timer_pid"] = wake_at, new_pid if isinstance(new_pid, int) else None
 
 
 def focused_pane(panes, agents_only=False):

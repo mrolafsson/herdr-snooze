@@ -30,14 +30,23 @@ if [ "$1" = "tick" ] && ! anything_snoozed; then
   exit 0
 fi
 
+# The cache says which program to run, so only a cache nobody else could have
+# written is used: owned by us, in a directory owned by us, neither writable by
+# group or others. Anything else is ignored and the interpreter found afresh.
+cache_trusted() {
+  [ -r "$state/python" ] && [ -O "$state/python" ] && [ -O "$state" ] || return 1
+  [ -z "$(find "$state" "$state/python" -maxdepth 0 \( -perm -g=w -o -perm -o=w \) 2>/dev/null)" ]
+}
+
 py=""
-if [ -r "$state/python" ]; then
+if cache_trusted; then
   read -r py < "$state/python"
 fi
 if [ -z "$py" ] || [ ! -x "$py" ]; then
   py=$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null)
   if [ -n "$py" ] && [ -x "$py" ]; then
-    mkdir -p "$state" 2>/dev/null && printf '%s\n' "$py" > "$state/python" 2>/dev/null
+    (umask 077 && mkdir -p "$state" && chmod go-w "$state" && printf '%s\n' "$py" > "$state/python.tmp.$$" \
+      && mv -f "$state/python.tmp.$$" "$state/python") 2>/dev/null
   fi
 fi
 exec "${py:-python3}" "$dir/snooze.py" "$@"
