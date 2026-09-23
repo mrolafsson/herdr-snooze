@@ -1,6 +1,6 @@
 id = "herdr-snooze"
 name = "Snooze"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "Hide an agent (or every agent in a space) from the Agents panel for 15 minutes, an hour, a day, a week… It comes back by itself."
 platforms = ["linux", "macos"]

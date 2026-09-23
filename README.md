@@ -303,10 +303,22 @@ survive a server restart, and another plugin can replace the view. Each snooze
 also arms one detached `sleep` that runs a tick at the next moment something
 needs doing. It sleeps, ticks once and is gone; it is not a daemon.
 
+Each herdr session has its own state, since pane IDs only mean something inside
+one session: the default session keeps `snoozed.json` in the plugin's state
+directory, and any other session in `sessions/<key>/` below it, keyed by its
+socket.
+
 The state file exists only while something is snoozed, and every command goes
 through `run.sh`, which exits before starting Python when a hook finds no file
 (~8ms per event). It also caches the real interpreter's path, because `python3`
 is often a pyenv/asdf shim that adds ~100ms to every start.
+
+The state file is only removed once herdr has confirmed our view is gone: if
+that last call fails, the file stays and the next event tries again, rather
+than leaving the panel filtered with nothing left to undo it. A state file that
+can't be read (corrupt, or edited by hand) is treated as "don't know", not
+"nothing snoozed": the next event un-hides everything snooze may have hidden
+and then removes the file.
 
 ## Development
 

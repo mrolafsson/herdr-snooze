@@ -17,7 +17,9 @@ Python 3.8+, standard library only.
 """
 
 import contextlib
+import copy
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -87,12 +89,45 @@ def _herdr_state_root():
     return os.path.join(base, "herdr", "plugins")
 
 
-def state_dir():
+def plugin_state_dir():
+    """The plugin's state directory. herdr gives one per plugin, shared by
+    every herdr session on the machine."""
     return (
         os.environ.get("SNOOZE_STATE_DIR")
         or os.environ.get("HERDR_PLUGIN_STATE_DIR")
         or os.path.join(_herdr_state_root(), PLUGIN_ID)
     )
+
+
+def default_socket():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "herdr", "herdr.sock")
+
+
+def socket_path():
+    return os.environ.get("HERDR_SOCKET_PATH") or default_socket()
+
+
+def session_key():
+    """'' for the default herdr session, else a short key for this one.
+
+    Pane and workspace IDs only mean something inside one herdr session, but
+    the state directory is shared by all of them: without this, a second
+    session would read the first one's snoozes, hide its own unrelated `w1:p1`
+    or delete the first's records as closed panes. The socket identifies the
+    session. The default session keeps the directory 0.1.0 used, so an
+    upgrade finds its snoozes where it left them."""
+    sock = os.path.realpath(socket_path())
+    if sock == os.path.realpath(default_socket()):
+        return ""
+    return hashlib.sha1(sock.encode("utf-8")).hexdigest()[:12]
+
+
+def state_dir():
+    """This session's state directory. run.sh's fast path must agree on where
+    state can live: it checks the plugin dir and every sessions/*/ below it."""
+    key = session_key()
+    return os.path.join(plugin_state_dir(), "sessions", key) if key else plugin_state_dir()
 
 
 def config_dir():
@@ -127,9 +162,7 @@ class HerdrError(Exception):
 
 def call(method, params=None, timeout=5.0):
     """One request per connection: the server answers a line and hangs up."""
-    path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(
-        os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"), "herdr", "herdr.sock"
-    )
+    path = socket_path()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -298,13 +331,29 @@ def empty_state():
     return {"v": 1, "panes": {}, "workspaces": {}, "view": {}, "timer": None}
 
 
+# A view record meaning "we may hold the view, but don't know what we set":
+# the next sync then asks herdr and clears it if it's ours.
+RECOVER = {"applied": "recover"}
+
+
 def read_state():
+    """The state file, or an empty state if there is none. A file that is
+    there but can't be read in full (corrupt, a hand edit, a crash mid-write)
+    is *not* taken as "nothing snoozed": tokens and our view may still be live
+    in herdr, and dropping them unexamined could leave agents hidden with no
+    record left to un-hide them. Such a state carries RECOVER, so the next sync
+    fails open: it clears tokens it has no record for and our view."""
     try:
         with open(os.path.join(state_dir(), "snoozed.json"), encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return empty_state()
+    except (OSError, ValueError):
+        state = empty_state()
+        state["view"] = dict(RECOVER)
+        return state
     state = empty_state()
+    damaged = not isinstance(data, dict)
     if isinstance(data, dict):
         # Every hook reads this file; one malformed entry (a hand edit, a
         # half-understood older version) must not make all of them crash.
@@ -314,12 +363,17 @@ def read_state():
                     name: entry for name, entry in data[key].items()
                     if isinstance(entry, dict) and isinstance(entry.get("until"), int)
                 }
+                damaged = damaged or len(state[key]) != len(data[key])
+            elif key in data:
+                damaged = True
         if isinstance(data.get("view"), dict):
             state["view"] = dict(data["view"])
             if "inherited" in state["view"] and not isinstance(state["view"]["inherited"], dict):
                 state["view"]["inherited"] = None
         if isinstance(data.get("timer"), int):
             state["timer"] = data["timer"]
+    if damaged and not state["view"]:
+        state["view"] = dict(RECOVER)
     return state
 
 
@@ -643,13 +697,23 @@ def sync(state, config, force=False):
     # Whose "off" flag to honour: the plugin holding the view right now, and
     # only while we hold it ourselves, the one we borrowed it from.
     foreign = owner.get("active") and owner.get("source") != SOURCE
+    view_before = copy.deepcopy(state["view"])
     action = plan_view(
         state, owner, count,
         sort_override=config["sort"], badge=config["badge"], views=config["views"], blocked=blocked,
         owner_off=owner_turned_off(owner if foreign else state["view"].get("inherited")),
     )
     if action:
-        call("agent.view.set" if action[0] == "set" else "agent.view.clear", action[1])
+        try:
+            call("agent.view.set" if action[0] == "set" else "agent.view.clear", action[1])
+        except (OSError, ValueError, HerdrError):
+            # plan_view already recorded the view as changed. If this was the
+            # last clear, that record would read "idle", the file would be
+            # deleted, run.sh would stop starting Python — and herdr would
+            # keep our filter, hiding agents, with nothing left to retry.
+            # Keep what was true before, so the next hook tries again.
+            state["view"] = view_before or dict(RECOVER)
+            raise
     if ops or action:
         log("sync:", len(ops), "token op(s);", "view " + action[0] if action else "view unchanged")
     return panes

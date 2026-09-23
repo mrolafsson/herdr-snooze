@@ -670,12 +670,123 @@ class Commands(unittest.TestCase):
         self.assertEqual(self.herdr.view, {"active": True, "source": RADAR, "label": "active"})
         self.assertFalse(os.path.exists(self.file))
 
-    def test_idle_tick_removes_a_file_that_holds_nothing(self):
+    def test_damaged_file_fails_open_then_goes(self):
+        # A record we can't read may stand for a live token and our live
+        # view. Deleting the file unexamined could leave agents hidden with
+        # nothing to un-hide them (0.1.0 did). Instead: clear tokens that
+        # have no readable record and our view, then remove the file.
+        for broken in ('{"panes": {"zz": {"until": "soon"}}}', "{not json", "[]"):
+            with self.subTest(broken=broken):
+                self.panes[1]["tokens"][snooze.TOKEN] = "z 12:00"
+                self.herdr.view = {"active": True, "source": snooze.SOURCE, "label": "z 1"}
+                with open(self.file, "w") as handle:
+                    handle.write(broken)
+                self.assertEqual(snooze.main(["tick"]), 0)
+                self.assertNotIn(snooze.TOKEN, self.panes[1]["tokens"])
+                self.assertEqual(self.herdr.view, {"active": False})
+                self.assertFalse(os.path.exists(self.file))  # or run.sh starts Python on every hook, forever
+
+    def test_damaged_file_leaves_another_plugins_view_alone(self):
         with open(self.file, "w") as handle:
-            handle.write('{"panes": {"zz": {"until": "soon"}}}')  # malformed: dropped on read
+            handle.write("{not json")
         self.assertEqual(snooze.main(["tick"]), 0)
-        self.assertFalse(os.path.exists(self.file))  # or run.sh starts Python on every hook, forever
-        self.assertEqual(self.herdr.calls, [])
+        self.assertEqual(self.herdr.view, {"active": True, "source": RADAR, "label": "active"})
+        self.assertFalse(os.path.exists(self.file))
+
+    def test_failed_last_clear_keeps_the_file_so_the_next_tick_retries(self):
+        # The last snooze has ended; clearing our view is all that's left.
+        self.snoozed(snooze.now_ms() - 1000)
+        self.herdr.view = {"active": True, "source": snooze.SOURCE, "label": "z 1"}
+        real = self.herdr.__call__
+
+        def dies_on_clear(method, params=None, timeout=5.0):
+            if method == "agent.view.clear" and params.get("source") == snooze.SOURCE:
+                raise OSError("herdr went away mid-call")
+            return real(method, params, timeout)
+
+        with mock.patch.object(snooze, "call", dies_on_clear):
+            with self.assertRaises(OSError):
+                snooze.main(["tick"])
+        self.assertTrue(os.path.exists(self.file), "deleted with our filter still live: nothing would retry")
+        self.assertEqual(snooze.main(["tick"]), 0)  # herdr is back
+        self.assertEqual(self.herdr.view, {"active": False})
+        self.assertFalse(os.path.exists(self.file))
+
+
+class Sessions(unittest.TestCase):
+    """Pane IDs only mean something inside one herdr session; the plugin's
+    state directory is shared by all of them."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        env = {"SNOOZE_STATE_DIR": self.dir.name, "XDG_CONFIG_HOME": os.path.join(self.dir.name, "cfg")}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("HERDR_SOCKET_PATH", None)
+
+    def in_session(self, sock):
+        return mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": sock} if sock else {})
+
+    def test_default_session_keeps_the_0_1_0_location(self):
+        self.assertEqual(snooze.state_dir(), self.dir.name)
+        with self.in_session(snooze.default_socket()):
+            self.assertEqual(snooze.state_dir(), self.dir.name)
+
+    def test_each_other_session_gets_its_own_state(self):
+        with self.in_session("/tmp/work.sock"):
+            a = snooze.state_dir()
+            with snooze.locked_state() as st:
+                st["panes"]["w1:p1"] = {"until": snooze.now_ms() + HOUR, "via": "pane"}
+        with self.in_session("/tmp/play.sock"):
+            b = snooze.state_dir()
+            self.assertEqual(snooze.read_state()["panes"], {})  # play doesn't see work's w1:p1
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith(os.path.join(self.dir.name, "sessions")))
+        self.assertEqual(snooze.read_state()["panes"], {})  # nor does the default session
+        with self.in_session("/tmp/work.sock"):
+            self.assertIn("w1:p1", snooze.read_state()["panes"])  # and work still has it
+
+
+class RunSh(unittest.TestCase):
+    """run.sh's fast path must find state wherever snooze.py puts it, or every
+    tick would exit early, silently, forever."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        # A stand-in "python" that records it was started.
+        self.marker = os.path.join(self.dir.name, "started")
+        fake = os.path.join(self.dir.name, "fakepy")
+        with open(fake, "w") as handle:
+            handle.write('#!/bin/sh\ntouch "%s"\n' % self.marker)
+        os.chmod(fake, 0o755)
+        with open(os.path.join(self.dir.name, "python"), "w") as handle:
+            handle.write(fake + "\n")
+        self.run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "run.sh")
+
+    def tick(self):
+        import subprocess
+        env = dict(os.environ, SNOOZE_STATE_DIR=self.dir.name)
+        subprocess.run(["/bin/sh", self.run_sh, "tick"], env=env, check=True)
+        started = os.path.exists(self.marker)
+        if started:
+            os.remove(self.marker)
+        return started
+
+    def test_idle_everywhere_starts_nothing(self):
+        self.assertFalse(self.tick())
+
+    def test_default_session_state_starts_python(self):
+        open(os.path.join(self.dir.name, "snoozed.json"), "w").close()
+        self.assertTrue(self.tick())
+
+    def test_another_sessions_state_starts_python(self):
+        session = os.path.join(self.dir.name, "sessions", "abc123")
+        os.makedirs(session)
+        open(os.path.join(session, "snoozed.json"), "w").close()
+        self.assertTrue(self.tick())
 
 
 class StateFile(unittest.TestCase):
@@ -708,10 +819,14 @@ class StateFile(unittest.TestCase):
             handle.write('{"panes": {"ok": {"until": 9}, "bad": {"til": 9}, "worse": 7}, "workspaces": [], "view": "x", "timer": "soon"}')
         st = snooze.read_state()
         self.assertEqual(st["panes"], {"ok": {"until": 9}})
-        self.assertEqual((st["workspaces"], st["view"], st["timer"]), ({}, {}, None))
+        # Dropped records may stand for live tokens and our view: the state
+        # says so, so the next sync checks herdr before anything is forgotten.
+        self.assertEqual((st["workspaces"], st["view"], st["timer"]), ({}, snooze.RECOVER, None))
         with open(self.path, "w") as handle:
             handle.write("not json")
-        self.assertTrue(snooze.is_idle(snooze.read_state()))
+        st = snooze.read_state()
+        self.assertFalse(snooze.is_idle(st))  # not "nothing snoozed": we can't tell
+        self.assertEqual(st["view"], snooze.RECOVER)
 
 
 UP, DOWN, ENTER, ESC, BACKSPACE =b"\x1b[A", b"\x1b[B", b"\r", b"\x1b", b"\x7f"
