@@ -849,13 +849,14 @@ def agent_identity(pane):
 def replaced(entry, pane):
     """Whether the agent in the pane is not the one that was snoozed: another
     kind, or any agent after this pane was seen with none, or after herdr
-    reported a new agent process there (agent_detected, below).
+    reported the snoozed one leaving or another arriving (agent_detected,
+    below).
 
     pane.list carries no process identity, and agent_session changes on the
     same agent's /clear, resume and compact, so neither can tell. What herdr
-    does give: pane.agent_detected each time it takes up an agent process,
-    including a new one of the same kind (and not on /clear and the like);
-    and `agent` cleared when the agent exits, or after several missed probes
+    does give: pane.agent_detected when an agent's process exits (a release,
+    so a quick restart of the same agent is seen too; not on /clear and the
+    like); and `agent` cleared when the agent exits, or after several missed probes
     while something else holds the foreground, so an agent that hands its
     terminal to an editor for a while loses its snooze and shows again. A
     record from before 0.2 (no identity) adopts the agent it finds."""
@@ -872,30 +873,39 @@ def replaced(entry, pane):
     return recorded.get("agent") != current["agent"]
 
 
-# A detection this soon after a snooze began is the snoozed agent's own,
-# delivered late: the picker only offers panes whose agent herdr already had.
+# An agent herdr reports arriving this soon after a snooze began is the
+# snoozed agent's own detection, delivered late: the picker only offers panes
+# whose agent herdr already had.
 DETECTED_GRACE_MS = 10 * 1000
 
 
-def agent_detected(state, pane_id, now):
-    """herdr took up a new agent process in pane_id. If a snooze there predates
-    it, the agent it was for is gone: the next reconcile treats the pane as
-    replaced. Returns True if a record was marked."""
-    entry = state["panes"].get(pane_id)
-    if entry is None or now - entry.get("since", 0) < DETECTED_GRACE_MS:
+def agent_detected(state, event, now):
+    """herdr's pane.agent_detected: sent when a pane's agent comes, goes or
+    changes kind, and when an agent is released (for Claude, Codex and the
+    like, that is its process exiting), with `released` set and `agent` still
+    naming the one that left. If a snooze in that pane predates it, the agent
+    it was for is gone: the next reconcile treats the pane as replaced. A
+    release, or the agent leaving, counts at once; an agent arriving counts
+    only after DETECTED_GRACE_MS. Returns True if a record was marked."""
+    entry = state["panes"].get(event.get("pane_id"))
+    if entry is None:
+        return False
+    left = event.get("released") is True or not event.get("agent")
+    if not left and now - entry.get("since", 0) < DETECTED_GRACE_MS:
         return False
     entry["agent_gone"] = True
     return True
 
 
-def detected_pane(event):
-    """The pane_id in a pane.agent_detected hook's event JSON, wherever herdr
-    nests it, or None."""
+def detected_event(event):
+    """The part of a pane.agent_detected hook's event JSON that names the pane
+    (with its `agent` and `released` beside it), wherever herdr nests it, or
+    None."""
     if isinstance(event, dict):
         if isinstance(event.get("pane_id"), str):
-            return event["pane_id"]
+            return event
         for value in event.values():
-            found = detected_pane(value)
+            found = detected_event(value)
             if found:
                 return found
     return None
@@ -1567,7 +1577,7 @@ def tick(args):
     waiting on the lock and on herdr. Every pass reads everything from herdr,
     so plain ticks carry nothing a later pass would miss. Two run regardless:
     the startup --force (it resets what a restart left behind) and a
-    --detected one, whose event (a new agent process in a pane) no later pass
+    --detected one, whose event (an agent leaving or arriving) no later pass
     could see.
 
     No note is ever stranded: the runner looks again after unlocking, and a
@@ -1576,20 +1586,25 @@ def tick(args):
 
     A --timer tick is the detached sleeper's; if it fails (herdr busy or
     restarting), nothing else may come along to arm the next one, so it arms a
-    retry itself while herdr's socket is there."""
+    retry itself while herdr's socket is there, and records it as the sleeper,
+    so the next tick counts on it rather than starting another beside it."""
     try:
         return _tick(args)
     except Exception:
         if "--timer" in args and os.path.exists(socket_path()) and not is_idle(read_state()):
-            with contextlib.suppress(OSError):
-                _spawn_timer(SAFETY_MS // 1000)
+            with contextlib.suppress(Exception):
+                pid = _spawn_timer(SAFETY_MS // 1000)
+                with locked_state() as state:
+                    stop_timer(state.get("timer_pid"))  # never this tick: it no longer looks like a sleeper
+                    state["timer"] = now_ms() + SAFETY_MS
+                    state["timer_pid"] = pid if isinstance(pid, int) else None
         raise
 
 
 def _tick(args):
     root = state_dir()
     if "--detected" in args:
-        return _tick_once(args, detected=detected_pane(hook_event()))
+        return _tick_once(args, detected=detected_event(hook_event()))
     if "--force" in args or not os.path.isdir(root):
         return _tick_once(args)
     pending = os.path.join(root, "tick.pending")
@@ -1632,7 +1647,8 @@ def _tick_once(args, detected=None):
         return 0
     with locked_state() as state:
         if detected and agent_detected(state, detected, now_ms()):
-            log("a new agent process in", detected, "- its snooze was for the one before")
+            log("agent", "released" if detected.get("released") else "changed", "in", detected["pane_id"],
+                "- its snooze was for the one before")
         sync(state, load_config(), force="--force" in args)
     return 0
 

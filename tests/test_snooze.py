@@ -289,29 +289,58 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(st["panes"], {})
 
     # ── v0.2: herdr's pane.agent_detected tells a new process of the same kind ──
+    # Its payload as herdr 0.9.1 sends it (api/schema/events.rs, emitted from
+    # app/api.rs emit_pane_state_update): on a release `agent` still names the
+    # agent that left.
+
+    @staticmethod
+    def detected(pid, agent="claude", released=False):
+        data = {"pane_id": pid, "workspace_id": "w1"}
+        if agent:
+            data["agent"] = agent
+        if released:
+            data.update(released=True, final_status="idle")
+        return {"event": "pane.agent_detected", "data": data}
 
     def test_a_quick_restart_of_the_same_agent_drops_the_snooze(self):
-        # Round 4: Claude A exits and Claude B starts before herdr ever shows
-        # the pane without an agent. Only the detected event can tell.
+        # Claude A exits and Claude B starts before herdr ever shows the pane
+        # without an agent: A's release is what tells.
         st = self.snoozed_claude(since=self.now - HOUR)
-        self.assertTrue(snooze.agent_detected(st, "p1", self.now))
+        event = snooze.detected_event(self.detected("p1", released=True))
+        self.assertTrue(snooze.agent_detected(st, event, self.now))
         self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-b")], self.now), [("clear", "p1")])
+
+    def test_a_release_right_after_snoozing_still_counts(self):
+        # A replacement seconds after the snooze is still a replacement.
+        st = self.snoozed_claude(since=self.now - 2000)
+        event = snooze.detected_event(self.detected("p1", released=True))
+        self.assertTrue(snooze.agent_detected(st, event, self.now))
+        self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-b")], self.now), [("clear", "p1")])
+
+    def test_the_agent_leaving_right_after_snoozing_counts(self):
+        st = self.snoozed_claude(since=self.now - 2000)
+        self.assertTrue(snooze.agent_detected(st, snooze.detected_event(self.detected("p1", agent=None)), self.now))
 
     def test_a_late_detection_of_the_snoozed_agent_itself_is_ignored(self):
         st = self.snoozed_claude(since=self.now - 2000)
-        self.assertFalse(snooze.agent_detected(st, "p1", self.now))
+        self.assertFalse(snooze.agent_detected(st, snooze.detected_event(self.detected("p1")), self.now))
         self.assertEqual(snooze.reconcile(st, [self.with_session("p1", "s-a")], self.now), [])
+
+    def test_an_agent_arriving_after_the_grace_drops_the_snooze(self):
+        # The editor handoff: herdr cleared `agent`, then took it up again.
+        st = self.snoozed_claude(since=self.now - HOUR)
+        self.assertTrue(snooze.agent_detected(st, snooze.detected_event(self.detected("p1")), self.now))
 
     def test_detections_elsewhere_change_nothing(self):
         st = self.snoozed_claude(since=self.now - HOUR)
-        self.assertFalse(snooze.agent_detected(st, "p2", self.now))
+        self.assertFalse(snooze.agent_detected(st, snooze.detected_event(self.detected("p2", released=True)), self.now))
         self.assertNotIn("agent_gone", st["panes"]["p1"])
 
     def test_the_detected_pane_is_found_in_herdrs_event(self):
-        event = {"event": "pane.agent_detected", "data": {"pane_id": "w1:p3", "agent": "claude"}}
-        self.assertEqual(snooze.detected_pane(event), "w1:p3")
-        self.assertIsNone(snooze.detected_pane({"event": "x"}))
-        self.assertIsNone(snooze.detected_pane(None))
+        event = snooze.detected_event(self.detected("w1:p3", released=True))
+        self.assertEqual((event["pane_id"], event["agent"], event["released"]), ("w1:p3", "claude", True))
+        self.assertIsNone(snooze.detected_event({"event": "x"}))
+        self.assertIsNone(snooze.detected_event(None))
 
     def test_a_closed_pane_is_not_mistaken_for_a_moved_one(self):
         st = self.snoozed_claude(terminal_id="t-p1")
@@ -1018,7 +1047,9 @@ class Commands(unittest.TestCase):
                          % (snooze.now_ms() + HOUR))
         snooze.main(["tick"])
         self.assertIn(snooze.MARK, self.panes[1]["tokens"])
-        event = {"event": "pane.agent_detected", "data": {"pane_id": "zz", "agent": "claude"}}
+        event = {"event": "pane.agent_detected",
+                 "data": {"pane_id": "zz", "workspace_id": "w1", "agent": "claude", "released": True,
+                          "final_status": "idle"}}
         root = snooze.state_dir()
         with open(os.path.join(root, "tick.lock"), "a") as lock, \
                 mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": snooze.json.dumps(event)}):
@@ -1033,12 +1064,17 @@ class Commands(unittest.TestCase):
         self.snoozed(snooze.now_ms() + 2 * 24 * HOUR)
         open(os.environ["HERDR_SOCKET_PATH"], "w").close()  # herdr is up
         broken = mock.Mock(side_effect=OSError("herdr busy"))
+        snooze._spawn_timer.return_value = 4343
         with mock.patch.object(snooze, "call", broken):
             for args in (["tick"], ["tick", "--timer"]):
                 snooze._spawn_timer.reset_mock()
                 with self.assertRaises(OSError):
                     snooze.main(args)
                 self.assertEqual(snooze._spawn_timer.called, args == ["tick", "--timer"], args)
+            # Recorded as the sleeper: the next tick counts on it instead of
+            # arming a second one beside it.
+            self.assertEqual(snooze.read_state()["timer_pid"], 4343)
+            self.assertGreater(snooze.read_state()["timer"], snooze.now_ms())
             os.remove(os.environ["HERDR_SOCKET_PATH"])  # herdr gone: don't keep a sleeper going
             snooze._spawn_timer.reset_mock()
             with self.assertRaises(OSError):
