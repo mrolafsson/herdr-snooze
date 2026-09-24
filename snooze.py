@@ -879,19 +879,25 @@ def replaced(entry, pane):
 DETECTED_GRACE_MS = 10 * 1000
 
 
-def agent_detected(state, event, now):
+def agent_detected(state, event, received):
     """herdr's pane.agent_detected: sent when a pane's agent comes, goes or
     changes kind, and when an agent is released (for Claude, Codex and the
     like, that is its process exiting), with `released` set and `agent` still
     naming the one that left. If a snooze in that pane predates it, the agent
     it was for is gone: the next reconcile treats the pane as replaced. A
     release, or the agent leaving, counts at once; an agent arriving counts
-    only after DETECTED_GRACE_MS. Returns True if a record was marked."""
+    only after DETECTED_GRACE_MS. Returns True if a record was marked.
+
+    `received` is when the hook started, not when it got the lock: herdr runs
+    hooks concurrently and in no order, so a release of the agent before can
+    reach the lock after the one that replaced it was snoozed. An event from
+    before the snooze is not about it."""
     entry = state["panes"].get(event.get("pane_id"))
     if entry is None:
         return False
+    age = received - entry.get("since", 0)
     left = event.get("released") is True or not event.get("agent")
-    if not left and now - entry.get("since", 0) < DETECTED_GRACE_MS:
+    if age < 0 or (not left and age < DETECTED_GRACE_MS):
         return False
     entry["agent_gone"] = True
     return True
@@ -1586,25 +1592,38 @@ def tick(args):
 
     A --timer tick is the detached sleeper's; if it fails (herdr busy or
     restarting), nothing else may come along to arm the next one, so it arms a
-    retry itself while herdr's socket is there, and records it as the sleeper,
-    so the next tick counts on it rather than starting another beside it."""
+    retry itself while herdr's socket is there (_arm_retry)."""
     try:
         return _tick(args)
     except Exception:
-        if "--timer" in args and os.path.exists(socket_path()) and not is_idle(read_state()):
+        if "--timer" in args and os.path.exists(socket_path()):
             with contextlib.suppress(Exception):
-                pid = _spawn_timer(SAFETY_MS // 1000)
-                with locked_state() as state:
-                    stop_timer(state.get("timer_pid"))  # never this tick: it no longer looks like a sleeper
-                    state["timer"] = now_ms() + SAFETY_MS
-                    state["timer_pid"] = pid if isinstance(pid, int) else None
+                _arm_retry()
         raise
+
+
+def _arm_retry():
+    """After a failed --timer tick: a sleeper SAFETY_MS out, recorded as the
+    sleeper so the next tick counts on it rather than starting another. Only
+    in place of this tick's own (the sleeper exec'd into it, keeping its PID)
+    or a dead one: a live sleeper another tick armed meanwhile is sooner or
+    as good, and stays."""
+    with locked_state() as state:
+        if is_idle(state):
+            return
+        current = state.get("timer_pid")
+        if current != os.getpid() and timer_alive(current) and is_our_timer(current):
+            return
+        pid = _spawn_timer(SAFETY_MS // 1000)
+        state["timer"] = now_ms() + SAFETY_MS
+        state["timer_pid"] = pid if isinstance(pid, int) else None
 
 
 def _tick(args):
     root = state_dir()
     if "--detected" in args:
-        return _tick_once(args, detected=detected_event(hook_event()))
+        received = now_ms()  # before any lock: agent_detected dates the event by it
+        return _tick_once(args, detected=detected_event(hook_event()), received=received)
     if "--force" in args or not os.path.isdir(root):
         return _tick_once(args)
     pending = os.path.join(root, "tick.pending")
@@ -1633,7 +1652,7 @@ def hook_event():
         return None
 
 
-def _tick_once(args, detected=None):
+def _tick_once(args, detected=None, received=None):
     prune_stale_sessions()
     if os.path.exists(os.path.join(plugin_state_dir(), "snoozed.json")):
         recover_legacy(load_config())
@@ -1646,7 +1665,7 @@ def _tick_once(args, detected=None):
                 pass
         return 0
     with locked_state() as state:
-        if detected and agent_detected(state, detected, now_ms()):
+        if detected and agent_detected(state, detected, received):
             log("agent", "released" if detected.get("released") else "changed", "in", detected["pane_id"],
                 "- its snooze was for the one before")
         sync(state, load_config(), force="--force" in args)

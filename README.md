@@ -189,14 +189,18 @@ event, sent when an agent's process exits (so a quick restart of the same
 agent is seen too; `/clear` and the like are not exits) and when a pane's agent
 comes, goes or changes kind, or the pane shown without an agent in between.
 herdr also shows a pane without its agent when the agent hands the terminal to
-another program (an editor it opened, say) for more than a few seconds; that
-agent then loses its snooze and reappears.
+another program (an editor it opened, say) for more than a few seconds, and
+reports an exit when the shell gets the terminal back (an agent suspended with
+Ctrl-Z, say); that agent then loses its snooze and reappears. So does an agent
+whose custom herdr integration reports a release while it keeps running.
 
 A new agent of the same kind keeps the old snooze, until it ends or you wake
-it, when herdr has nothing to report: when the plugin misses the event (it was
-disabled at that moment, or a burst of events outran herdr's limit of 32
-plugin commands at once), or when something swaps one agent for another
-before herdr samples the pane in between, so it never sees the first one exit.
+it, when snooze doesn't hear the old one leave: when the plugin misses that
+event (it was disabled at that moment, or a burst of events outran herdr's
+limit of 32 plugin commands at once) and the new agent arrives within ten
+seconds of the snooze (an arrival that soon is taken for the snoozed agent's
+own), or when something swaps one agent for another before herdr samples the
+pane in between, so it never sees the first one exit.
 
 One gap is left: a pane moved to another space and herdr stopped within the
 same instant, before snooze's hook for the move ran, comes back after the

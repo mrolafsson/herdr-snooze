@@ -1,6 +1,6 @@
 id = "herdr-snooze"
 name = "Snooze"
-version = "0.2.1"
+version = "0.2.2"
 min_herdr_version = "0.9.0"
 description = "Hide an agent (or every agent in a space) from the Agents panel for 15 minutes, an hour, a day, a week… It comes back by itself."
 platforms = ["linux", "macos"]
@@ -71,8 +71,9 @@ command = ["/bin/sh", "run.sh", "tick", "--force"]
 on = "pane.agent_status_changed"
 command = ["/bin/sh", "run.sh", "tick"]
 
-# herdr took up an agent process in a pane: also a new agent of the same kind,
-# which pane.list alone can't tell from the old one.
+# A pane's agent came, went or changed kind, or its process exited (a release):
+# how a new agent of the same kind is told from the old one, which pane.list
+# alone can't do.
 [[events]]
 on = "pane.agent_detected"
 command = ["/bin/sh", "run.sh", "tick", "--detected"]

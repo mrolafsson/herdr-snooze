@@ -331,6 +331,21 @@ class Reconcile(unittest.TestCase):
         st = self.snoozed_claude(since=self.now - HOUR)
         self.assertTrue(snooze.agent_detected(st, snooze.detected_event(self.detected("p1")), self.now))
 
+    def test_a_release_from_before_the_snooze_is_not_about_it(self):
+        # Round 4: A exits, B starts, you snooze B while A's release hook is
+        # still waiting on the lock. The hook started before the snooze.
+        st = self.snoozed_claude(since=self.now)
+        event = snooze.detected_event(self.detected("p1", released=True))
+        self.assertFalse(snooze.agent_detected(st, event, self.now - 500))
+        self.assertNotIn("agent_gone", st["panes"]["p1"])
+
+    def test_an_arrival_is_dated_by_when_its_hook_started_not_when_it_got_the_lock(self):
+        # It started 2s into the snooze and waited out the picker's lock: still
+        # the snoozed agent's own detection, however late it is handled.
+        st = self.snoozed_claude(since=self.now - HOUR)
+        event = snooze.detected_event(self.detected("p1"))
+        self.assertFalse(snooze.agent_detected(st, event, self.now - HOUR + 2000))
+
     def test_detections_elsewhere_change_nothing(self):
         st = self.snoozed_claude(since=self.now - HOUR)
         self.assertFalse(snooze.agent_detected(st, snooze.detected_event(self.detected("p2", released=True)), self.now))
@@ -1075,11 +1090,39 @@ class Commands(unittest.TestCase):
             # arming a second one beside it.
             self.assertEqual(snooze.read_state()["timer_pid"], 4343)
             self.assertGreater(snooze.read_state()["timer"], snooze.now_ms())
+            st = snooze.read_state()
+            with mock.patch.object(snooze, "timer_alive", lambda pid: pid == 4343):
+                snooze._spawn_timer.reset_mock()
+                snooze.arm_timer(st, snooze.now_ms())
+                snooze._spawn_timer.assert_not_called()
             os.remove(os.environ["HERDR_SOCKET_PATH"])  # herdr gone: don't keep a sleeper going
             snooze._spawn_timer.reset_mock()
             with self.assertRaises(OSError):
                 snooze.main(["tick", "--timer"])
             snooze._spawn_timer.assert_not_called()
+
+    def test_a_failed_timer_tick_leaves_a_live_sleeper_armed_meanwhile(self):
+        # Round 4: another hook armed a sooner sleeper while this tick failed.
+        self.snoozed(snooze.now_ms() + 2 * 24 * HOUR)
+        open(os.environ["HERDR_SOCKET_PATH"], "w").close()
+        with snooze.locked_state() as st:
+            st["timer"], st["timer_pid"] = snooze.now_ms() + 60_000, 777
+        broken = mock.Mock(side_effect=OSError("herdr busy"))
+        with mock.patch.object(snooze, "call", broken), \
+                mock.patch.object(snooze, "timer_alive", lambda pid: True), \
+                mock.patch.object(snooze, "is_our_timer", lambda pid: pid == 777):
+            snooze._spawn_timer.reset_mock()
+            with self.assertRaises(OSError):
+                snooze.main(["tick", "--timer"])
+            snooze._spawn_timer.assert_not_called()
+            self.assertEqual(snooze.read_state()["timer_pid"], 777)
+            # This tick's own PID (the sleeper exec'd into it) is replaced.
+            with snooze.locked_state() as st:
+                st["timer_pid"] = os.getpid()
+            snooze._spawn_timer.return_value = 4545
+            with self.assertRaises(OSError):
+                snooze.main(["tick", "--timer"])
+            self.assertEqual(snooze.read_state()["timer_pid"], 4545)
 
     def test_the_sleeper_ticks_as_a_timer(self):
         self.assertTrue(snooze.TIMER_SCRIPT.endswith("tick --timer"))
