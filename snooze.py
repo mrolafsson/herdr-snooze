@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1453,8 +1454,89 @@ def picker_snooze(term, config):
         return "snoozed %s %s (%d pane(s)) until %s" % (kind, target, covered, until.strftime("%Y-%m-%d %H:%M"))
 
 
+def popup_file():
+    """The running picker's pid. herdr shows one popup at a time, open as long
+    as its command runs, on whichever client counts as active: with several
+    attached (another terminal, a mosh session) the picker can be left open
+    on one you're not looking at, and every open after fails with ui_busy.
+    An open that meets that ends the picker named here (end_own_popup)."""
+    return os.path.join(plugin_state_dir(), "popup.pid")
+
+
+@contextlib.contextmanager
+def noted_popup():
+    """Record this process as the picker while it runs; forget it after,
+    unless a newer picker has replaced it."""
+    pid = str(os.getpid())
+    try:
+        os.makedirs(plugin_state_dir(), exist_ok=True)
+        with open(popup_file(), "w", encoding="utf-8") as handle:
+            handle.write(pid)
+    except OSError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            with open(popup_file(), encoding="utf-8") as handle:
+                mine = handle.read().strip() == pid
+            if mine:
+                os.remove(popup_file())
+
+
+def is_own_popup(pid):
+    """Whether pid is this plugin's picker, not a stranger given the pid
+    after ours exited."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            args = handle.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        try:
+            out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        args = out.stdout.split()
+    return any(os.path.basename(a) == "snooze.py" for a in args) and "picker" in args
+
+
+def end_own_popup():
+    """End our picker if one is running, and wait for it to go: whether it
+    was ours to end. Someone else's popup is theirs to close."""
+    try:
+        with open(popup_file(), encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 1 or not is_own_popup(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _quit_on_sigterm(signum, frame):
+    # A newer open replacing this picker: leave through RawTerminal's exit, so
+    # the terminal is restored.
+    raise SystemExit(0)
+
+
 def run_picker():
     config = load_config()
+    signal.signal(signal.SIGTERM, _quit_on_sigterm)
+    with noted_popup():
+        return _run_picker(config)
+
+
+def _run_picker(config):
     with RawTerminal() as term:
         try:
             outcome = picker_snooze(term, config)
@@ -1485,13 +1567,23 @@ def open_picker(env, rows):
         "plugin_id": PLUGIN_ID, "entrypoint": "picker", "placement": "popup", "focus": True,
         "width": 50, "height": rows, "env": env,
     }
-    for attempt in range(4):
+    replaced = False
+    for attempt in range(5):
         try:
             call("plugin.pane.open", params)
             return 0
         except HerdrError as error:
+            if error.code == "ui_busy" and attempt >= 3 and not replaced:
+                # Still busy: if it's our picker left open elsewhere, end it
+                # and open here; someone else's popup is theirs to close.
+                replaced = end_own_popup()
+                if replaced:
+                    continue
+                notify("Snooze", "Another popup is open: close it (esc) and try again.")
+                log("open failed:", error)
+                return 1
             # The menu this action was picked from may still be closing.
-            if error.code != "ui_busy" or attempt == 3:
+            if error.code != "ui_busy" or attempt == 4:
                 notify("Snooze", "Couldn't open the picker: %s" % error)
                 log("open failed:", error)
                 return 1

@@ -1852,3 +1852,62 @@ class OwnerOffFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeftBehindPicker(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        patcher = mock.patch.dict(os.environ, {"SNOOZE_STATE_DIR": self.dir})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_picker_notes_itself_and_forgets_after(self):
+        with snooze.noted_popup():
+            with open(snooze.popup_file()) as handle:
+                self.assertEqual(handle.read(), str(os.getpid()))
+        self.assertFalse(os.path.exists(snooze.popup_file()))
+
+    def test_a_newer_picker_is_not_forgotten(self):
+        with snooze.noted_popup():
+            with open(snooze.popup_file(), "w") as handle:
+                handle.write("999999")
+        with open(snooze.popup_file()) as handle:
+            self.assertEqual(handle.read(), "999999")
+
+    def test_only_our_own_picker_is_ended(self):
+        self.assertFalse(snooze.end_own_popup())  # none noted
+        import subprocess
+        sleeper = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        with open(snooze.popup_file(), "w") as handle:
+            handle.write(str(sleeper.pid))
+        self.assertFalse(snooze.end_own_popup())
+        self.assertIsNone(sleeper.poll(), "a stranger was ended")
+
+    def test_ui_busy_ends_our_picker_and_opens_again(self):
+        busy = snooze.HerdrError("ui_busy", "a popup pane is already open")
+        calls = []
+
+        def call(method, params=None, **_):
+            calls.append(method)
+            if len(calls) <= 4:
+                raise busy
+            return {}
+
+        with mock.patch.object(snooze, "call", side_effect=call), \
+                mock.patch.object(snooze, "end_own_popup", return_value=True) as ended, \
+                mock.patch.object(snooze.time, "sleep"):
+            self.assertEqual(snooze.open_picker({}, 10), 0)
+        ended.assert_called_once()
+        self.assertEqual(len(calls), 5)
+
+    def test_someone_elses_popup_is_left_alone(self):
+        busy = snooze.HerdrError("ui_busy", "a popup pane is already open")
+        with mock.patch.object(snooze, "call", side_effect=busy), \
+                mock.patch.object(snooze, "end_own_popup", return_value=False), \
+                mock.patch.object(snooze, "notify") as notify, \
+                mock.patch.object(snooze.time, "sleep"):
+            self.assertEqual(snooze.open_picker({}, 10), 1)
+        self.assertIn("Another popup", notify.call_args[0][1])
