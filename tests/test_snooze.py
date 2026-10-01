@@ -16,6 +16,18 @@ NOON = datetime(2026, 9, 20, 12, 0, 0)  # a Sunday
 HOUR = 3600 * 1000
 RADAR = "plugin:hhdebb.herdr-radar"
 
+_HOMES = tempfile.TemporaryDirectory()
+
+
+def setUpModule():
+    # panel_mode reads herdr's client state and config.toml: keep the machine
+    # running the tests out of it (an empty home is herdr's default, spaces).
+    patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": os.path.join(_HOMES.name, "state"),
+                                           "XDG_CONFIG_HOME": os.path.join(_HOMES.name, "config")})
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    unittest.addModuleCleanup(_HOMES.cleanup)
+
 
 def live_token(value="z"):
     """The tokens a pane snooze has hidden carries (0.2+): display + MARK."""
@@ -428,6 +440,18 @@ class PlanView(unittest.TestCase):
         st["panes"] = {}
         self.assertEqual(snooze.plan_view(st, {"active": True, "source": snooze.SOURCE}, 0), ("clear", {"source": snooze.SOURCE}))
         self.assertEqual(st["view"], {})
+
+    def test_keeps_herdrs_own_order_and_label_on_a_free_view(self):
+        for mode, label in (("priority", "priority z 1"), ("spaces", "grouped z 1")):
+            st = state(dict(self.snoozed))
+            params = snooze.plan_view(st, {"active": False}, 1, badge="z", mode=mode)[1]
+            self.assertEqual((params["label"], params["sort"]), (label, snooze.PANEL_MODES[mode][1]))
+            self.assertEqual(snooze.plan_view(st, {"active": True, "source": snooze.SOURCE}, 0, mode=mode)[0], "clear")
+
+    def test_a_borrowed_view_ignores_herdrs_own_order(self):
+        st = state(dict(self.snoozed))
+        params = snooze.plan_view(st, {"active": True, "source": RADAR, "label": "active"}, 1, badge="z", mode="priority")[1]
+        self.assertEqual((params["label"], params["sort"]), ("active z 1", snooze.KNOWN_VIEWS[RADAR]["sorts"]["active"]))
 
     def test_borrows_radars_sort_and_hands_the_view_back(self):
         st = state(dict(self.snoozed))
@@ -1136,6 +1160,34 @@ class Commands(unittest.TestCase):
         self.assertEqual(self.herdr.view_params["filter"], snooze.VIEW_FILTER)
         self.notify.assert_not_called()
 
+    def test_order_flips_herdrs_own_order_until_the_last_snooze_ends(self):
+        self.herdr.view = {"active": False}
+        self.snoozed(snooze.now_ms() + HOUR)
+        self.assertEqual(snooze.main(["order"]), 0)  # herdr's own here is spaces (an empty home)
+        self.assertEqual(self.herdr.view_params["label"], "priority* z 1")
+        self.assertEqual(self.herdr.view_params["sort"], snooze.PANEL_MODES["priority"][1])
+        self.assertEqual(snooze.main(["tick"]), 0)
+        self.assertEqual(self.herdr.view_params["label"], "priority* z 1")  # a tick keeps it
+        self.assertEqual(snooze.main(["order"]), 0)
+        self.assertEqual(self.herdr.view_params["label"], "grouped z 1")
+        self.assertNotIn("order", snooze.read_state()["view"])
+        self.assertEqual(snooze.main(["order"]), 0)
+        self.assertEqual(snooze.main(["wake", "--all"]), 0)  # the flip ends with the view
+        self.assertEqual(self.herdr.view, {"active": False})
+        self.notify.assert_not_called()
+
+    def test_order_leaves_a_borrowed_order_alone(self):
+        self.snoozed(snooze.now_ms() + HOUR)
+        snooze.main(["tick"])
+        self.assertEqual(snooze.main(["order"]), 0)
+        self.notify.assert_called_once_with("Snooze", "The panel's order belongs to %s." % RADAR)
+        self.assertEqual(self.herdr.view_params["sort"], snooze.KNOWN_VIEWS[RADAR]["sorts"]["active"])
+
+    def test_order_with_nothing_snoozed_points_at_herdrs_own_switch(self):
+        self.assertEqual(snooze.main(["order"]), 0)
+        self.notify.assert_called_once_with("Snooze", "Nothing is snoozed: click the panel's label to switch its order.")
+        self.assertEqual(self.herdr.calls, [])
+
     def test_toggle_with_nothing_snoozed_says_so_and_touches_nothing(self):
         self.assertEqual(snooze.main(["toggle"]), 0)
         self.notify.assert_called_once_with("Snooze", "Nothing is snoozed.")
@@ -1834,6 +1886,48 @@ class PickerSnooze(unittest.TestCase):
             for line in frame.split("\n"):
                 visible = re.sub(r"\x1b\[[0-9;]*m", "", line)
                 self.assertLessEqual(len(visible), inner, repr(visible))
+
+
+class PanelMode(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.state_home = os.path.join(self.dir.name, "state")
+        self.config_home = os.path.join(self.dir.name, "config")
+
+    def mode(self, sock="/home/u/.config/herdr/herdr.sock"):
+        return snooze.panel_mode(sock, self.state_home, self.config_home)
+
+    def write(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    def write_config(self, text):
+        self.write(os.path.join(self.config_home, "herdr", "config.toml"), text)
+
+    def test_defaults_to_spaces(self):
+        self.assertEqual(self.mode(), "spaces")
+
+    def test_reads_ui_section_of_config_toml(self):
+        self.write_config('[ui]\nagent_panel_sort = "priority"  # queue\n')
+        self.assertEqual(self.mode(), "priority")
+        self.write_config('[ui]\nagent_panel_sort = "workspaces"\n')
+        self.assertEqual(self.mode(), "spaces")
+        self.write_config('[other]\nagent_panel_sort = "priority"\n[ui]\n# agent_panel_sort = "priority"\n')
+        self.assertEqual(self.mode(), "spaces")
+
+    def test_the_client_toggle_wins(self):
+        # herdr names the file by an FNV-1a hash of the *client* socket: this
+        # pair is the real one from a herdr 0.9.1 install.
+        sock = "/home/hjortur/.config/herdr/herdr.sock"
+        prefs = os.path.join(self.state_home, "herdr", "client-shell", "local-210362bdd8c9dea1.json")
+        self.write_config('[ui]\nagent_panel_sort = "spaces"\n')
+        self.write(prefs, '{"agent_panel_sort": "priority"}')
+        self.assertEqual(self.mode(sock), "priority")
+        self.assertEqual(self.mode("/elsewhere/herdr.sock"), "spaces")  # another session's toggle
+        self.write(prefs, "not json")
+        self.assertEqual(self.mode(sock), "spaces")
 
 
 class OwnerOffFlag(unittest.TestCase):

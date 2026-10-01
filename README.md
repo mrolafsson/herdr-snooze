@@ -81,6 +81,7 @@ herdr plugin link ./herdr-snooze
 | `herdr-snooze.agent` | One key, both ways: on an active agent it asks how long and hides it; on a snoozed agent it wakes it, no popup. |
 | `herdr-snooze.workspace` | Same, for every agent in the current space — including agents that start there later. |
 | `herdr-snooze.toggle` | Flip the Agents panel to list only what is snoozed, and back. |
+| `herdr-snooze.order` | Switch the Agents panel between `priority` and `grouped` order while anything is snoozed, when herdr's own switch is locked. |
 | `herdr-snooze.wake` | Wake the focused pane's agent; never snoozes. For scripts, or a key that should only ever wake. |
 | `herdr-snooze.wake-all` | Wake everything. |
 
@@ -108,9 +109,17 @@ A preset counts from the moment you pick it, not from when the popup opened.
 
 ### Seeing what is snoozed, and waking it
 
-While anything is snoozed, the Agents panel label shows the icon and a count:
-`💤 2` (or, when another plugin labels the panel, its label plus the count, such
-as `active 💤 2`).
+While anything is snoozed, the Agents panel label shows the icon and a count
+after herdr's own `grouped` or `priority` label, such as `priority 💤 2`, and
+the panel keeps that order. When another plugin labels the panel, its label
+takes that place instead, such as `active 💤 2`.
+
+herdr doesn't let its label be clicked to switch order while anything is
+snoozed, so `herdr-snooze.order` switches it in its place (bind it to a key like
+the toggle). The switch lasts only until the last snooze ends: herdr keeps its
+own setting, and a plugin can't change it. While it's switched away from
+herdr's own, the label shows a `*`, such as `grouped* 💤 2`. It does nothing
+while another plugin orders the panel.
 
 The sidebar is the only list there is: it shows either your active agents or
 your snoozed ones, and `herdr-snooze.toggle` picks which. On the snoozed
