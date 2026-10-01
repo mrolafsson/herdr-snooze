@@ -446,7 +446,7 @@ def empty_state():
 RECOVER = {"applied": "recover"}
 
 # What each field of the view record may hold (plan_view reads them all).
-VIEW_FIELDS = {"applied": str, "inherited": (dict, type(None)), "showing": str, "from_pane": (str, type(None))}
+VIEW_FIELDS = {"applied": str, "inherited": (dict, type(None)), "showing": str, "from_pane": (str, type(None)), "order": str}
 INHERITED_FIELDS = {"source": (str, type(None)), "label": (str, type(None))}
 
 
@@ -929,6 +929,72 @@ def known_sort(owner, views=None):
     return known["sorts"].get(label) if known else None
 
 
+# herdr's own panel order, for when nobody else holds the view. Any view hides
+# the panel's "grouped"/"priority" label (and its toggle) behind the view's own
+# label, and a view with no sort gets the server's config.toml order, not the
+# one toggled in the client. So we re-state both. The sorts are herdr 0.9.1's
+# (src/app/agent_view.rs): spaces is plain workspace/tab/pane order, priority
+# is attention then latest state change.
+PANEL_MODES = {
+    "spaces": ("grouped", [
+        {"field": "workspace_order", "order": "asc"},
+        {"field": "tab_order", "order": "asc"},
+        {"field": "pane_order", "order": "asc"},
+    ]),
+    "priority": ("priority", [
+        {"field": "attention", "order": "desc"},
+        {"field": "state_change_seq", "order": "desc"},
+    ]),
+}
+
+
+def _mode_name(value):
+    value = {"workspaces": "spaces"}.get(value, value)
+    return value if value in PANEL_MODES else None
+
+
+def _fnv1a64(text):
+    value = 0xcbf29ce484222325
+    for byte in text.encode("utf-8"):
+        value = ((value ^ byte) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def panel_mode(sock=None, state_home=None, config_home=None):
+    """herdr's current panel order: "spaces" or "priority". A toggle in the
+    client wins; herdr saves it per client, in a file named by a hash of the
+    client socket (the API socket with "-client" before ".sock"). Otherwise
+    [ui] agent_panel_sort in config.toml, otherwise herdr's default."""
+    sock = sock or socket_path()
+    root, ext = os.path.splitext(sock)
+    client_sock = root + "-client" + ext if ext == ".sock" else sock + "-client"
+    state_home = state_home or os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    prefs = os.path.join(state_home, "herdr", "client-shell", "local-%016x.json" % _fnv1a64(client_sock))
+    try:
+        with open(prefs, encoding="utf-8") as handle:
+            mode = _mode_name(json.load(handle).get("agent_panel_sort"))
+        if mode:
+            return mode
+    except (OSError, ValueError, AttributeError):
+        pass
+    config_home = config_home or os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(config_home, "herdr", "config.toml"), encoding="utf-8") as handle:
+            section = None
+            for line in handle:
+                line = line.split("#", 1)[0].strip()
+                header = re.match(r"\[([^\]]+)\]$", line)
+                if header:
+                    section = header.group(1).strip()
+                    continue
+                found = re.match(r'agent_panel_sort\s*=\s*"([^"]*)"$', line)
+                if section == "ui" and found:
+                    return _mode_name(found.group(1)) or "spaces"
+    except OSError:
+        pass
+    return "spaces"
+
+
 def owner_turned_off(owner, state_root=None):
     known = KNOWN_VIEWS.get((owner or {}).get("source"))
     if not known or not known.get("off_flag"):
@@ -960,11 +1026,12 @@ def settle_showing(state, focused):
     return True
 
 
-def plan_view(state, owner, count, sort_override=None, badge=DEFAULT_BADGE, owner_off=False, views=None, blocked=0):
+def plan_view(state, owner, count, sort_override=None, badge=DEFAULT_BADGE, owner_off=False, views=None, blocked=0, mode=None):
     """Decide what to do with herdr's single agent view. `owner` is the probe
     result ({active, source, label}); `count` is how many *agents* are snoozed
-    and `blocked` how many active ones are blocked. Mutates state["view"];
-    returns ("set", params), ("clear", params) or None."""
+    and `blocked` how many active ones are blocked. `mode` is herdr's own panel
+    order (panel_mode), kept when there is no other owner to borrow from.
+    Mutates state["view"]; returns ("set", params), ("clear", params) or None."""
     view = state["view"]
     mine = bool(owner.get("active")) and owner.get("source") == SOURCE
     inherited = view.get("inherited")
@@ -992,7 +1059,15 @@ def plan_view(state, owner, count, sort_override=None, badge=DEFAULT_BADGE, owne
     # agent that exited) hides nothing, and a filter held for it would make the
     # snoozed list an empty panel.
     if count:
-        base = (inherited or {}).get("label")
+        # `order` is the `order` command's flip of herdr's own order: herdr
+        # won't let its label be clicked while we hold the view. It lasts
+        # only while we do (herdr keeps its own mode in the client), so the
+        # label marks it with "*".
+        order = _mode_name(view.get("order")) if not inherited else None
+        native_label, native_sort = PANEL_MODES.get(order or mode, (None, None)) if not inherited else (None, None)
+        if order and order != mode and native_label:
+            native_label += "*"
+        base = (inherited or {}).get("label") or native_label
         # `showing` is the toggle: the same panel, flipped to list what is
         # snoozed. The two labels must not be confusable — one means "N are
         # hidden from this list", the other "this list IS the hidden ones".
@@ -1005,10 +1080,12 @@ def plan_view(state, owner, count, sort_override=None, badge=DEFAULT_BADGE, owne
             "source": SOURCE,
             "label": label.strip(),
             "filter": SNOOZED_LIST_FILTER if showing_snoozed else VIEW_FILTER,
-            "sort": sort_override or known_sort(inherited, views) or [],
+            "sort": sort_override or known_sort(inherited, views) or native_sort or [],
         }
         fingerprint = json.dumps(want, sort_keys=True)
         state["view"] = {"inherited": inherited, "applied": fingerprint}
+        if order and order != mode:
+            state["view"]["order"] = order
         if showing_snoozed:
             state["view"]["showing"] = "snoozed"
             state["view"]["from_pane"] = view.get("from_pane")
@@ -1186,7 +1263,7 @@ def sync(state, config, force=False, strict=False):
         action = plan_view(
             state, owner, count,
             sort_override=config["sort"], badge=config["badge"], views=config["views"], blocked=blocked,
-            owner_off=owner_turned_off(owner if foreign else state["view"].get("inherited")),
+            mode=panel_mode(), owner_off=owner_turned_off(owner if foreign else state["view"].get("inherited")),
         )
     except Exception:
         # Whatever went wrong, never leave the view record half-planned:
@@ -1654,6 +1731,7 @@ USAGE = """usage: snooze.py <command>
   picker                          the popup itself
   tick [--force|--detected|--timer]  reconcile tokens and the agent view
   toggle                          Agents panel: only snoozed <-> active
+  order                           Agents panel: priority <-> grouped, while anything is snoozed
   snooze <pane_id|workspace:ID> <duration>
   wake --all | <pane_id|workspace:ID>...
   list"""
@@ -1799,6 +1877,29 @@ def main(argv):
                 # cleared it. A key press that does nothing needs a reason.
                 notify("Snooze", "Nothing is snoozed.")
             log("toggle: showing", "snoozed" if showing else "active")
+        return 0
+
+    if command == "order":
+        config = load_config()
+        with locked_state() as state:
+            view = state["view"]
+            if not state["panes"]:
+                notify("Snooze", "Nothing is snoozed: click the panel's label to switch its order.")
+                return 0
+            if view.get("inherited"):
+                notify("Snooze", "The panel's order belongs to %s." % (view["inherited"].get("source") or "another plugin"))
+                return 0
+            if config["sort"]:
+                notify("Snooze", "config.json pins the panel's order (\"sort\").")
+                return 0
+            mode = panel_mode()
+            current = _mode_name(view.get("order")) or mode
+            view["order"] = "spaces" if current == "priority" else "priority"
+            sync(state, config)
+            flipped = state["view"].get("order")
+            if not state["view"].get("applied"):
+                notify("Snooze", "Nothing is snoozed: click the panel's label to switch its order.")
+            log("order:", flipped or mode, "(herdr's own: %s)" % mode)
         return 0
 
     if command == "snooze" and len(args) == 2:
