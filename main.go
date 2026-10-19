@@ -13,6 +13,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -64,6 +65,14 @@ func run(args []string) (int, error) {
 	}
 	command, args := args[0], args[1:]
 	switch {
+	case command == "remote-info" && len(args) == 0:
+		info, err := connectionInfo()
+		if err != nil {
+			return 1, err
+		}
+		return 0, json.NewEncoder(os.Stdout).Encode(info)
+	case command == "rpc" && len(args) == 0:
+		return 0, serveRemote(os.Stdin, os.Stdout)
 	case command == "action" && len(args) > 0:
 		return runAction(args[0])
 	case command == "picker":

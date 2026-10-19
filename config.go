@@ -34,6 +34,9 @@ type config struct {
 	NotifyWake bool
 	// WokeBadge is "$woke" on an agent that just woke; "" for none.
 	WokeBadge string
+	// Machines includes enabled saved SSH machines in the popup. Hooks and
+	// timers always remain local to their owning server.
+	Machines bool
 }
 
 func defaultConfig() config {
@@ -44,6 +47,7 @@ func defaultConfig() config {
 		WakeBlocked: true,
 		NotifyWake:  true,
 		WokeBadge:   defaultWokeBadge,
+		Machines:    true,
 	}
 }
 
@@ -189,11 +193,13 @@ func loadConfig() config {
 			} else {
 				invalid(key)
 			}
-		case "notify", "auto_return", "wake_when_blocked", "notify_wake":
+		case "notify", "auto_return", "wake_when_blocked", "notify_wake", "machines":
 			b, ok := value.(bool)
 			switch {
 			case !ok:
 				invalid(key)
+			case key == "machines":
+				cfg.Machines = b
 			case key == "notify":
 				cfg.Notify = b
 			case key == "auto_return":
@@ -255,8 +261,14 @@ func viewsOK(value any) (map[string]map[string][]any, bool) {
 	return out, true
 }
 
-// logf writes to the plugin log: herdr captures a plugin's stdout
-// (`herdr plugin log list --plugin herdr-snooze`).
+// Herdr captures normal plugin logs on stdout. An SSH RPC process reserves
+// stdout for its one JSON reply and directs these diagnostics to stderr.
+var rpcLogging bool
+
 func logf(format string, args ...any) {
-	fmt.Printf(format+"\n", args...)
+	out := os.Stdout
+	if rpcLogging {
+		out = os.Stderr
+	}
+	fmt.Fprintf(out, format+"\n", args...)
 }

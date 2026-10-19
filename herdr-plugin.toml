@@ -70,6 +70,14 @@ description = "The list on made-up agents: try it, or take screenshots without s
 contexts = ["global"]
 command = ["./bin/herdr-snooze", "action", "demo"]
 
+# Read-only handshake for saved-machine popups. Its stdout is retrieved by
+# exact plugin log ID; paths are supplied by this server, never guessed.
+[[actions]]
+id = "remote-info"
+title = "Snooze: connection info (internal)"
+contexts = ["global"]
+command = ["./bin/herdr-snooze", "remote-info"]
+
 [[actions]]
 id = "wake-all"
 title = "Wake all snoozed agents"

@@ -22,7 +22,7 @@ time is up.
   itself drops what hides it at the deadline.
 - **One list of everything.** What's snoozed and until when, and every agent
   that isn't: wake one, change when it wakes, or snooze another from the
-  same popup.
+  same popup. Enabled saved SSH machines appear there too, labelled by machine.
 - **Or look in the panel.** One key flips the Agents panel to only what's
   snoozed, and back.
 - **Nothing stuck stays hidden.** A snoozed agent that comes to need you
@@ -107,6 +107,9 @@ about, and on the Snoozed tab `ctrl+w` wakes one.
 
 - **herdr 0.9.0** or later.
 - **Linux** or **macOS**, on arm64 or x86-64.
+- For saved machines: **herdr 0.9.5** or later on the popup's host, this
+  Snooze build installed and enabled on each remote server, and working
+  noninteractive OpenSSH access. Local-only use does not need SSH.
 
 ## Install
 
@@ -250,6 +253,46 @@ An agent woken out of a snoozed space stays awake while the space sleeps on.
 The keys along the bottom are pills, and buttons: the one under the pointer
 underlines, and a click presses it. Hovering a row selects it, and the wheel
 scrolls.
+
+### Saved SSH machines
+
+The popup includes enabled profiles from `herdr machine list --json` on the
+machine running the plugin. Each profile targets its saved Herdr session;
+profiles saved on those remote hosts are not followed recursively.
+Remote rows include the machine label beside the workspace. `s`, `w`, `S`
+and `W` work on them as they do locally. Wake all covers Local and the
+successfully loaded machines shown in this popup, not unreachable hosts.
+
+The owning server keeps its snooze records, timer and Agents-panel view.
+Closing the popup or disconnecting the laptop does not stop remote wakeups.
+Matching pane IDs on different machines are kept separate. A disabled,
+removed or retargeted profile, changed server session, or replaced terminal
+is rejected instead of falling back to Local.
+
+Local agents load immediately while remote reads run in the background,
+at most four at once. Remote snapshots refresh about every ten seconds.
+An offline host or missing/older Snooze installation produces a message at
+the bottom; it does not stop local snoozing. Nothing is installed, updated
+or restarted automatically. A failed write is not retried, because it may
+have reached the server before the connection broke. Refresh the list to
+check the result before choosing the action again.
+
+Remote navigation is separate: Herdr's public plugin API does not switch
+the client's selected machine. Enter on a remote row explains which
+machine to select in Herdr. Recap links are only shown for local rows,
+so an identically numbered local agent cannot be opened by mistake.
+
+Connections use Herdr's saved-machine CLI to find the remote plugin and its
+actual socket, config and state paths. The request then goes to that
+installed binary over noninteractive OpenSSH, as JSON on stdin. Paths are
+shell-quoted; host-key checking stays strict. Normal SSH config and the
+SSH agent apply, but this helper does not reuse Herdr's private managed
+MFA connection. If authentication exists only in that connection, make
+ordinary noninteractive SSH access available first; Snooze never opens an
+authentication prompt or handles keys.
+
+Set `"machines": false` in `config.json` to keep the popup local-only.
+This also avoids saved-machine discovery on older Herdr versions.
 
 ### In the Agents panel
 
@@ -452,6 +495,7 @@ herdr plugin config-dir herdr-snooze
 | `wake_when_blocked` | `true` | Wake a snoozed agent when it comes to need you. |
 | `notify_wake` | `true` | Show a herdr notification when an agent wakes by itself (not when you wake it). |
 | `theme` | `""` | `"dark"` or `"light"` to say what your terminal is, instead of asking it. See [Colours](#colours). |
+| `machines` | `true` | Include enabled saved SSH machines in the popup; `false` keeps all reads and actions local. Remote hosts need this Snooze build and ordinary noninteractive SSH access. |
 | `views` | — | Teach snooze another plugin's panel order. See below. |
 | `sort` | — | Always use this `agent.view.set` sort while something is snoozed. |
 

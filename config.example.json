@@ -3,6 +3,7 @@
   "badge": "💤",
   "woke_badge": "⏰",
   "notify": false,
+  "machines": true,
   "wake_when_blocked": true,
   "notify_wake": true,
   "views": {

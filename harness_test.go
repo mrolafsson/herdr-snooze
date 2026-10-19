@@ -29,6 +29,16 @@ var noon = time.Date(2026, 9, 20, 12, 0, 0, 0, time.Local)
 var realSpawnTimer = spawnTimer
 
 func TestMain(m *testing.M) {
+	if os.Getenv("SNOOZE_TEST_RPC_HELPER") == "1" {
+		// An actual protocol process for the two-server integration test.
+		// It must never leave a real sleeper behind.
+		spawnTimer = func(int64) (int, error) { return 0, nil }
+		if err := serveRemote(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if sock := os.Getenv("SNOOZE_TEST_SESSION_ID"); sock != "" {
 		// A helper process for TestTwoFirstRunsAgreeOnOneID.
 		fmt.Print(sessionID(sock))

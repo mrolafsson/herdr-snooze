@@ -61,10 +61,11 @@ type row struct {
 func (r row) key() string { return strconv.Itoa(int(r.kind)) + ":" + r.id }
 
 type loadedMsg struct {
-	st     *state
-	panes  []pane
-	spaces []workspaceInfo
-	err    error
+	st       *state
+	panes    []pane
+	spaces   []workspaceInfo
+	err      error
+	warnings []string
 }
 
 // doneMsg is a snooze or a wake that finished. note is what to say.
@@ -98,17 +99,18 @@ type model struct {
 	input    textinput.Model
 	tried    bool // enter was pressed on what's typed
 
-	rows    []row
-	cursor  int
-	offset  int
-	loaded  bool
-	st      *state
-	labels  map[string]string // workspace labels by ID
-	panes   []pane
-	busy    bool
-	flash   string
-	err     string
-	outcome string // what was done, for the log, when the popup closes on it
+	rows        []row
+	cursor      int
+	offset      int
+	loaded      bool
+	st          *state
+	labels      map[string]string // workspace labels by ID
+	panes       []pane
+	busy        bool
+	flash       string
+	err         string
+	machineNote string
+	outcome     string // what was done, for the log, when the popup closes on it
 
 	width, height  int
 	mouseX, mouseY int
@@ -346,6 +348,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err.Error()
 			return m, nil
 		}
+		m.machineNote = machineWarning(msg.warnings)
 		m.st, m.panes = msg.st, msg.panes
 		m.labels = map[string]string{}
 		for _, w := range msg.spaces {
@@ -439,6 +442,10 @@ func (m model) listKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "r":
 		if r := m.selected(); r != nil && r.kind == rowPane {
+			if _, remote, _ := parseRemoteRef(r.id); remote {
+				m.err = "Open Recap on the owning machine to read this agent."
+				return m, nil
+			}
 			if to, ok := m.links[recapPlugin]; ok {
 				if err := m.world.open(recapFor(to, r.id)); err != nil {
 					m.err = err.Error()
@@ -955,6 +962,8 @@ func (m model) statusLine() string {
 		return " " + styleErr.Render(shorten(m.err, w))
 	case m.flash != "":
 		return " " + styleOK.Render(shorten(m.flash, w))
+	case m.machineNote != "":
+		return " " + styleErr.Render(shorten(m.machineNote, w))
 	}
 	return ""
 }
@@ -987,7 +996,8 @@ func (m model) footer() []hint {
 		}
 	}
 	if r := m.selected(); r != nil && r.kind == rowPane {
-		if _, ok := m.links[recapPlugin]; ok {
+		_, remote, _ := parseRemoteRef(r.id)
+		if _, ok := m.links[recapPlugin]; ok && !remote {
 			hs = append(hs, hint{"r recap", "r", hintView})
 		}
 	}
@@ -1060,16 +1070,22 @@ func runPicker(demo bool) error {
 	darkTerminal = dark
 	useTheme(pickerTheme(dark))
 
+	// A SIGTERM (a newer open replacing this popup) ends it cleanly,
+	// restoring the terminal and cancelling its SSH reads.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	var w world = liveWorld{}
 	if demo {
 		w = newDemoWorld()
 	} else {
 		defer notePopup()()
+		if cfg.Machines {
+			remoteCtx, cancel := context.WithCancel(ctx)
+			machines := newMachineWorld(w, sshTransport{ctx: remoteCtx})
+			defer machines.stop(cancel)
+			w = machines
+		}
 	}
-	// A SIGTERM (a newer open replacing this popup) ends it cleanly,
-	// restoring the terminal.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	var back *popupRef
 	if p, ok := cameFrom(); ok {

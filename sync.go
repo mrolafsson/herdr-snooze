@@ -183,9 +183,19 @@ var errStale = errors.New("stale target")
 // when is a condition to wake on as well (whenDone, whenMerged), with until
 // its cap; "" for a plain snooze.
 func snooze(kind, target string, until time.Time, cfg config, expect *agentID, when string) (int, error) {
+	return snoozeExpected(kind, target, until, cfg, expect, when, "", nil)
+}
+
+// Remote rows also pin the terminal identity across the final state-file lock.
+func snoozeExpected(kind, target string, until time.Time, cfg config, expect *agentID, when, terminal string, check func() error) (int, error) {
 	untilMS := until.UnixMilli()
 	covered := 0
 	err := withState(func(st *state) error {
+		if check != nil {
+			if err := check(); err != nil {
+				return err
+			}
+		}
 		if kind == "workspace" {
 			st.Workspaces[target] = &spaceEntry{Until: untilMS, Dirty: true}
 			for _, e := range st.Panes {
@@ -209,6 +219,8 @@ func snooze(kind, target string, until time.Time, cfg config, expect *agentID, w
 				switch {
 				case found == nil:
 					return fmt.Errorf("%w: that pane moved or closed; open snooze on it again", errStale)
+				case terminal != "" && found.TerminalID != terminal:
+					return fmt.Errorf("%w: that terminal was replaced; refresh the agent list", errStale)
 				case agentIdentity(*found) == nil:
 					return fmt.Errorf("%w: the agent there has exited; open snooze on it again", errStale)
 				case replaced(&paneEntry{AgentID: expect}, *found):
@@ -253,8 +265,18 @@ func snooze(kind, target string, until time.Time, cfg config, expect *agentID, w
 // wake ends snoozes now: these panes, these workspaces (and the panes they
 // covered), or everything. It returns how many panes it woke.
 func wake(cfg config, paneIDs, workspaceIDs []string, everything bool) (int, error) {
+	return wakeExpected(cfg, paneIDs, workspaceIDs, everything, nil)
+}
+
+// check runs under the state lock, before any state or token is cleared.
+func wakeExpected(cfg config, paneIDs, workspaceIDs []string, everything bool, check func() error) (int, error) {
 	woken := 0
 	err := withState(func(st *state) error {
+		if check != nil {
+			if err := check(); err != nil {
+				return err
+			}
+		}
 		var ops []tokenOp
 		var spaces []string
 		for _, wid := range sortedKeys(st.Workspaces) {
