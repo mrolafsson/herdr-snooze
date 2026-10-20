@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2 - 2026-10-20
+
+- **herdr-vitals joins the plugins that work together.** The README's
+  table has it: how your machines are doing, and in Recap's header, the
+  machine's CPU and memory, a click from Vitals.
+
 ## 0.5.1 - 2026-10-13
 
 - **herdr-file-transfer joins the plugins that work together.** The README's
